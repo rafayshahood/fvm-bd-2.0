@@ -1,0 +1,420 @@
+[
+  {
+    "case": "C5 - Anti Spoofing",
+    "video": "spook8.mp4",
+    "expected": "spoof",
+    "status": "error",
+    "message": "\u274c spoof detected: too many fake frames.",
+    "verdict": "pass"
+  },
+  {
+    "case": "C5 - Anti Spoofing",
+    "video": "spook9.mp4",
+    "expected": "spoof",
+    "status": "error",
+    "message": "\u274c spoof detected: too many fake frames.",
+    "verdict": "pass"
+  },
+  {
+    "case": "C5 - Anti Spoofing",
+    "video": "spook 1.mp4",
+    "expected": "spoof",
+    "status": "error",
+    "message": "\u274c spoof detected: too many fake frames.",
+    "verdict": "pass"
+  },
+  {
+    "case": "C5 - Anti Spoofing",
+    "video": "spook20.mp4",
+    "expected": "spoof",
+    "status": "error",
+    "message": "\u274c spoof detected: too many fake frames.",
+    "verdict": "pass"
+  },
+  {
+    "case": "C5 - Anti Spoofing",
+    "video": "spook21.mp4",
+    "expected": "spoof",
+    "status": "error",
+    "message": "\u274c spoof detected: too many fake frames.",
+    "verdict": "pass"
+  },
+  {
+    "case": "C5 - Anti Spoofing",
+    "video": "spook23.mp4",
+    "expected": "spoof",
+    "status": "error",
+    "message": "\u274c spoof detected: too many fake frames.",
+    "verdict": "pass"
+  },
+  {
+    "case": "C5 - Anti Spoofing",
+    "video": "spook22.mp4",
+    "expected": "spoof",
+    "status": "error",
+    "message": "\u274c spoof detected: too many fake frames.",
+    "verdict": "pass"
+  },
+  {
+    "case": "C5 - Anti Spoofing",
+    "video": "spook26.mp4",
+    "expected": "spoof",
+    "status": "error",
+    "message": "\u274c spoof detected: too many fake frames.",
+    "verdict": "pass"
+  },
+  {
+    "case": "C5 - Anti Spoofing",
+    "video": "spook27.mp4",
+    "expected": "spoof",
+    "status": "error",
+    "message": "\u274c spoof detected: too many fake frames.",
+    "verdict": "pass"
+  },
+  {
+    "case": "C5 - Anti Spoofing",
+    "video": "spook19.mp4",
+    "expected": "spoof",
+    "status": "error",
+    "message": "\u274c spoof detected: too many fake frames.",
+    "verdict": "pass"
+  },
+  {
+    "case": "C5 - Anti Spoofing",
+    "video": "spook18.mp4",
+    "expected": "spoof",
+    "status": "error",
+    "message": "\u274c spoof detected: too many fake frames.",
+    "verdict": "pass"
+  },
+  {
+    "case": "C5 - Anti Spoofing",
+    "video": "spook24.mp4",
+    "expected": "spoof",
+    "status": "error",
+    "message": "\u274c spoof detected: too many fake frames.",
+    "verdict": "pass"
+  },
+  {
+    "case": "C5 - Anti Spoofing",
+    "video": "spook15.mp4",
+    "expected": "spoof",
+    "status": "error",
+    "message": "\u274c spoof detected: too many fake frames.",
+    "verdict": "pass"
+  },
+  {
+    "case": "C5 - Anti Spoofing",
+    "video": "spook14.mp4",
+    "expected": "spoof",
+    "status": "error",
+    "message": "\u274c multiple faces/prints detected in the video.",
+    "verdict": "fail"
+  },
+  {
+    "case": "C5 - Anti Spoofing",
+    "video": "spook16.mp4",
+    "expected": "spoof",
+    "status": "error",
+    "message": "\u274c glasses detected in most frames.",
+    "verdict": "fail"
+  },
+  {
+    "case": "C5 - Anti Spoofing",
+    "video": "spook17.mp4",
+    "expected": "spoof",
+    "status": "error",
+    "message": "\u274c spoof detected: too many fake frames.",
+    "verdict": "pass"
+  },
+  {
+    "case": "C5 - Anti Spoofing",
+    "video": "spook13.mp4",
+    "expected": "spoof",
+    "status": "error",
+    "message": "\u274c spoof detected: too many fake frames.",
+    "verdict": "pass"
+  },
+  {
+    "case": "C5 - Anti Spoofing",
+    "video": "spook12.mp4",
+    "expected": "spoof",
+    "status": "success",
+    "status_text": "\u274c Unverified",
+    "score": 0.0059,
+    "average_score": -0.0235,
+    "verdict": "fail"
+  },
+  {
+    "case": "C5 - Anti Spoofing",
+    "video": "spook10.mp4",
+    "expected": "spoof",
+    "status": "error",
+    "message": "\u274c glasses detected in most frames.",
+    "verdict": "fail"
+  },
+  {
+    "case": "C5 - Anti Spoofing",
+    "video": "spook11.mp4",
+    "expected": "spoof",
+    "status": "error",
+    "message": "\u274c glasses detected in most frames.",
+    "verdict": "fail"
+  },
+  {
+    "case": "C5 - Anti Spoofing",
+    "video": "spook2.mp4",
+    "expected": "spoof",
+    "status": "error",
+    "message": "\u274c spoof detected: too many fake frames.",
+    "verdict": "pass"
+  },
+  {
+    "case": "C5 - Anti Spoofing",
+    "video": "spook3.mp4",
+    "expected": "spoof",
+    "status": "error",
+    "message": "\u274c spoof detected: too many fake frames.",
+    "verdict": "pass"
+  },
+  {
+    "case": "C5 - Anti Spoofing",
+    "video": "spook4.mp4",
+    "expected": "spoof",
+    "status": "error",
+    "message": "\u274c spoof detected: too many fake frames.",
+    "verdict": "pass"
+  },
+  {
+    "case": "C5 - Anti Spoofing",
+    "video": "spook5.mp4",
+    "expected": "spoof",
+    "status": "error",
+    "message": "\u274c spoof detected: too many fake frames.",
+    "verdict": "pass"
+  },
+  {
+    "case": "C5 - Anti Spoofing",
+    "video": "spook7.mp4",
+    "expected": "spoof",
+    "status": "error",
+    "message": "\u274c spoof detected: too many fake frames.",
+    "verdict": "pass"
+  },
+  {
+    "case": "C5 - Anti Spoofing",
+    "video": "spook6.mp4",
+    "expected": "spoof",
+    "status": "error",
+    "message": "\u274c spoof detected: too many fake frames.",
+    "verdict": "pass"
+  },
+  {
+    "case": "C4 - Glasses vs No Glasses",
+    "video": "glasses 9.mp4",
+    "expected": "glasses",
+    "status": "error",
+    "message": "\u274c glasses detected in most frames.",
+    "verdict": "pass"
+  },
+  {
+    "case": "C4 - Glasses vs No Glasses",
+    "video": "glasses 1.mp4",
+    "expected": "glasses",
+    "status": "error",
+    "message": "\u274c glasses detected in most frames.",
+    "verdict": "pass"
+  },
+  {
+    "case": "C4 - Glasses vs No Glasses",
+    "video": "glasses 6.mp4",
+    "expected": "glasses",
+    "status": "error",
+    "message": "\u274c glasses detected in most frames.",
+    "verdict": "pass"
+  },
+  {
+    "case": "C4 - Glasses vs No Glasses",
+    "video": "glasses 7.mp4",
+    "expected": "glasses",
+    "status": "error",
+    "message": "\u274c glasses detected in most frames.",
+    "verdict": "pass"
+  },
+  {
+    "case": "C4 - Glasses vs No Glasses",
+    "video": "glasses 5.mp4",
+    "expected": "glasses",
+    "status": "error",
+    "message": "\u274c glasses detected in most frames.",
+    "verdict": "pass"
+  },
+  {
+    "case": "All Conditions Met",
+    "video": "real 2.mp4",
+    "expected": "pass",
+    "status": "success",
+    "status_text": "\u274c Unverified",
+    "score": 0.0328,
+    "average_score": 0.0082,
+    "verdict": "pass"
+  },
+  {
+    "case": "All Conditions Met",
+    "video": "real 3.mp4",
+    "expected": "pass",
+    "status": "success",
+    "status_text": "\u274c Unverified",
+    "score": 0.1045,
+    "average_score": 0.0166,
+    "verdict": "pass"
+  },
+  {
+    "case": "All Conditions Met",
+    "video": "real 7.mp4",
+    "expected": "pass",
+    "status": "success",
+    "status_text": "\u274c Unverified",
+    "score": 0.042,
+    "average_score": 0.0032,
+    "verdict": "pass"
+  },
+  {
+    "case": "All Conditions Met",
+    "video": "real 6.mp4",
+    "expected": "pass",
+    "status": "success",
+    "status_text": "\u274c Unverified",
+    "score": 0.0524,
+    "average_score": -0.0006,
+    "verdict": "pass"
+  },
+  {
+    "case": "All Conditions Met",
+    "video": "real 4.mp4",
+    "expected": "pass",
+    "status": "success",
+    "status_text": "\u274c Unverified",
+    "score": 0.009,
+    "average_score": -0.0351,
+    "verdict": "pass"
+  },
+  {
+    "case": "All Conditions Met",
+    "video": "real 5.mp4",
+    "expected": "pass",
+    "status": "success",
+    "status_text": "\u274c Unverified",
+    "score": -0.0206,
+    "average_score": -0.0414,
+    "verdict": "pass"
+  },
+  {
+    "case": "All Conditions Met",
+    "video": "real 11.mp4",
+    "expected": "pass",
+    "status": "success",
+    "status_text": "\u274c Unverified",
+    "score": -0.0224,
+    "average_score": -0.0387,
+    "verdict": "pass"
+  },
+  {
+    "case": "All Conditions Met",
+    "video": "real 10.mp4",
+    "expected": "pass",
+    "status": "error",
+    "message": "\u274c glasses detected in most frames.",
+    "verdict": "fail"
+  },
+  {
+    "case": "All Conditions Met",
+    "video": "real 13.mp4",
+    "expected": "pass",
+    "status": "success",
+    "status_text": "\u274c Unverified",
+    "score": 0.0763,
+    "average_score": 0.0202,
+    "verdict": "pass"
+  },
+  {
+    "case": "All Conditions Met",
+    "video": "real 17.mp4",
+    "expected": "pass",
+    "status": "success",
+    "status_text": "\u274c Unverified",
+    "score": 0.0046,
+    "average_score": -0.0249,
+    "verdict": "pass"
+  },
+  {
+    "case": "All Conditions Met",
+    "video": "real 16.mp4",
+    "expected": "pass",
+    "status": "success",
+    "status_text": "\u274c Unverified",
+    "score": 0.0174,
+    "average_score": -0.0028,
+    "verdict": "pass"
+  },
+  {
+    "case": "All Conditions Met",
+    "video": "real 14.mp4",
+    "expected": "pass",
+    "status": "success",
+    "status_text": "\u274c Unverified",
+    "score": -0.0414,
+    "average_score": -0.0628,
+    "verdict": "pass"
+  },
+  {
+    "case": "All Conditions Met",
+    "video": "real 15.mp4",
+    "expected": "pass",
+    "status": "success",
+    "status_text": "\u274c Unverified",
+    "score": 0.0244,
+    "average_score": 0.0022,
+    "verdict": "pass"
+  },
+  {
+    "case": "All Conditions Met",
+    "video": "real 18.mp4",
+    "expected": "pass",
+    "status": "success",
+    "status_text": "\u274c Unverified",
+    "score": -0.0265,
+    "average_score": -0.0424,
+    "verdict": "pass"
+  },
+  {
+    "case": "All Conditions Met",
+    "video": "real 19.mp4",
+    "expected": "pass",
+    "status": "success",
+    "status_text": "\u274c Unverified",
+    "score": -0.0106,
+    "average_score": -0.029,
+    "verdict": "pass"
+  },
+  {
+    "case": "All Conditions Met",
+    "video": "real 1.mp4 again.mp4",
+    "expected": "pass",
+    "status": "success",
+    "status_text": "\u274c Unverified",
+    "score": 0.0335,
+    "average_score": 0.0121,
+    "verdict": "pass"
+  },
+  {
+    "case": "All Conditions Met",
+    "video": "real 8.mp4",
+    "expected": "pass",
+    "status": "success",
+    "status_text": "\u274c Unverified",
+    "score": -0.0367,
+    "average_score": -0.0727,
+    "verdict": "pass"
+  }
+]

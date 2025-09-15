@@ -1,0 +1,32 @@
+# Ignore environment folder
+env/
+.venv/
+
+# Ignore IDs folder
+ids/
+
+# Ignore Python cache
+__pycache__/
+*.pyc
+
+# # Ignore model weights and videos
+*.pt
+*.pth
+*.mp4
+*.mov
+*.avi
+
+# Ignore node_modules and other frontend build files (if any)
+node_modules/
+dist/
+build/
+models/
+sample_vidoes/
+selected_faces/
+temp/
+video_faces/
+test_cases_fvm/
+
+# Ignore system files
+.DS_Storerecordings/
+recordings/

@@ -1,0 +1,17 @@
+FROM runpod/pytorch:2.1.0-py3.10-cuda11.8.0-devel-ubuntu22.04
+
+# Set working directory
+WORKDIR /app
+
+# Copy files
+COPY . /app
+
+# Install dependencies
+RUN pip install --upgrade pip && \
+    pip install -r requirements.txt
+
+# Expose port
+EXPOSE 8888
+
+# Start the app
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8888"]
