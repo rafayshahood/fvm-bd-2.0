@@ -42,9 +42,15 @@ DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 print(f"🖥️ onlanders.video using device: {DEVICE}")
 
 # ---- Models (loaded once; used by LIVE path) ----
-MODEL = YOLO("yolov8n-face-lindevs.pt").to(DEVICE)
-GLASSES_MODEL = YOLO("./glasses.pt").to(DEVICE)
-GLASSES_CLASS_NAMES = ["glasses", "no glasses"]
+FACE_MODEL = YOLO("yolov8n-face-lindevs.pt").to(DEVICE)
+
+# REPLACED: detection model -> classification model
+# Expect names: {0:'with_glasses', 1:'without_glasses'}
+GLASSES_CLS_MODEL = YOLO("glass-classification.pt").to(DEVICE)
+GLASSES_NAMES = GLASSES_CLS_MODEL.names or {0: "with_glasses", 1: "without_glasses"}
+WITH_ID = next((k for k, v in GLASSES_NAMES.items() if v == "with_glasses"), 0)
+WITHOUT_ID = next((k for k, v in GLASSES_NAMES.items() if v == "without_glasses"), 1)
+GLASSES_CONF_THRESH = float(os.getenv("GLASSES_CONF", "0.60"))
 
 spoof_model = AntiSpoofPredict(0)
 image_cropper = CropImage()
@@ -52,6 +58,41 @@ image_cropper = CropImage()
 # ---- Offline pipeline config ----
 NUM_FRAMES_TO_SELECT = 15
 
+# ---- Letterbox / mapping helpers (to avoid aspect distortion) ----
+LB_COLOR = (114, 114, 114)
+DET_IMG_SIZE = 640
+CLS_IMG_SIZE = 224
+
+def _letterbox_square(img: np.ndarray, size: int = 640, color=(114,114,114)):
+    h, w = img.shape[:2]
+    r = min(size / w, size / h)
+    new_w, new_h = int(round(w * r)), int(round(h * r))
+    resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    dw, dh = size - new_w, size - new_h
+    left, right = dw // 2, dw - dw // 2
+    top, bottom = dh // 2, dh - dh // 2
+    out = cv2.copyMakeBorder(resized, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)
+    return out, r, (left, top)
+
+def _map_box_back(xyxy, r, pad, orig_w, orig_h):
+    left, top = pad
+    x1, y1, x2, y2 = map(float, xyxy)
+    x1 = (x1 - left) / r; y1 = (y1 - top) / r
+    x2 = (x2 - left) / r; y2 = (y2 - top) / r
+    x1 = max(0, min(orig_w - 1, x1)); y1 = max(0, min(orig_h - 1, y1))
+    x2 = max(0, min(orig_w - 1, x2)); y2 = max(0, min(orig_h - 1, y2))
+    return float(x1), float(y1), float(x2), float(y2)
+
+def _pad_to_square(img: np.ndarray, pad_value=114):
+    h, w = img.shape[:2]
+    if h == w:
+        return img
+    if h > w:
+        d = h - w; l = d // 2; r = d - l
+        return cv2.copyMakeBorder(img, 0, 0, l, r, cv2.BORDER_CONSTANT, value=(pad_value,)*3)
+    else:
+        d = w - h; t = d // 2; b = d - t
+        return cv2.copyMakeBorder(img, t, b, 0, 0, cv2.BORDER_CONSTANT, value=(pad_value,)*3)
 
 # -------------------------------------------------
 # Utility: normalize to mp4 (h264/aac) with validation
@@ -72,7 +113,6 @@ def convert_to_mp4(input_path: str | Path, output_dir: str | Path) -> Path:
         capture_output=True, text=True,
     )
     if proc.returncode != 0 or not out.exists() or out.stat().st_size == 0:
-        # tidy up partial file and surface a clear error
         try:
             if out.exists():
                 out.unlink()
@@ -87,38 +127,53 @@ def convert_to_mp4(input_path: str | Path, output_dir: str | Path) -> Path:
 # LIVE path: per-frame checks for UX gating
 # -------------------------------------------------
 def analyze_frame(frame, ellipse_params=None) -> dict:
+    """
+    Returns a dict consumed by the FE. Key changes:
+      * Face is detected on a letterboxed copy (no distortion), bbox mapped back.
+      * Glasses check uses classifier on a square, resized crop of the largest face.
+    """
     result = {
         "checks": get_checks(),
         "face_detected": False,
         "num_faces": 0,
         "one_face": True,
-        "largest_bbox": None,
+        "largest_bbox": None,           # [x1,y1,x2,y2] in ORIGINAL coords
         "inside_ellipse": False,
         "brightness_status": None,
-        "glasses_detected": None,
+        "glasses_detected": None,       # True if confidently "with_glasses"
+        "glasses_top1": None,           # 'with_glasses' / 'without_glasses'
+        "glasses_conf": None,           # float confidence
         "spoof_is_real": None,
         "spoof_status": None,
     }
 
-    # 1) Face detection
-    if CHECKS["face"]:
-        det = MODEL.predict(source=[frame], imgsz=640, device=DEVICE, verbose=False)[0]
-        if not det or len(det.boxes) == 0:
-            return result
-        result["face_detected"] = True
-        result["num_faces"] = len(det.boxes)
-        result["one_face"] = (len(det.boxes) == 1)
+    H, W = frame.shape[:2]
 
-        boxes = det.boxes.xyxy.detach().cpu().numpy()
-        areas = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
-        x1, y1, x2, y2 = boxes[areas.argmax()].astype(float)
+    # 1) Face detection (letterboxed, then map back)
+    if CHECKS["face"]:
+        lb_img, r, pad = _letterbox_square(frame, size=DET_IMG_SIZE, color=LB_COLOR)
+        det = FACE_MODEL.predict(source=[lb_img], imgsz=DET_IMG_SIZE, device=DEVICE, verbose=False)[0]
+        if not det or det.boxes is None or len(det.boxes) == 0:
+            return result
+
+        # pick largest by area (in letterbox space), then map that box back
+        boxes_lb = det.boxes.xyxy.detach().cpu().numpy()
+        areas = (boxes_lb[:, 2] - boxes_lb[:, 0]) * (boxes_lb[:, 3] - boxes_lb[:, 1])
+        bx_lb = boxes_lb[areas.argmax()]
+        x1, y1, x2, y2 = _map_box_back(bx_lb.tolist(), r, pad, W, H)
+
+        result["face_detected"] = True
+        result["num_faces"] = len(boxes_lb)
+        result["one_face"] = (len(boxes_lb) == 1)
         result["largest_bbox"] = [float(x1), float(y1), float(x2), float(y2)]
     else:
+        # If face-check disabled, pretend one face present
         result["face_detected"] = True
         result["num_faces"] = 1
         result["one_face"] = True
+        # NOTE: largest_bbox stays None if we truly skip face detection
 
-    # 2) Inside ellipse
+    # 2) Inside ellipse (uses mapped-back bbox)
     if CHECKS["ellipse"]:
         if ellipse_params is None or result["largest_bbox"] is None:
             return result
@@ -144,7 +199,7 @@ def analyze_frame(frame, ellipse_params=None) -> dict:
     else:
         result["inside_ellipse"] = True
 
-    # 3) Brightness
+    # 3) Brightness (whole frame)
     if CHECKS["brightness"]:
         mean_b = float(np.mean(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)))
         if mean_b < 50:
@@ -155,7 +210,7 @@ def analyze_frame(frame, ellipse_params=None) -> dict:
     else:
         result["brightness_status"] = "ok"
 
-    # 4) Anti-spoof
+    # 4) Anti-spoof (unchanged)
     if CHECKS["spoof"]:
         try:
             image_bbox = spoof_model.get_bbox(frame)
@@ -179,11 +234,40 @@ def analyze_frame(frame, ellipse_params=None) -> dict:
         result["spoof_is_real"] = None
         result["spoof_status"] = "disabled"
 
-    # 5) Glasses
+    # 5) Glasses classification (uses face crop -> square -> 224 -> classifier)
     if CHECKS["glasses"]:
-        g_res = GLASSES_MODEL.predict([frame], device=DEVICE, verbose=False)
-        has_glasses = any(int(box.cls[0]) == 0 for box in g_res[0].boxes)  # idx 0 -> "glasses"
-        result["glasses_detected"] = has_glasses
+        try:
+            if result["largest_bbox"] is not None:
+                fx1, fy1, fx2, fy2 = map(int, result["largest_bbox"])
+                fx1 = max(0, min(W - 1, fx1)); fy1 = max(0, min(H - 1, fy1))
+                fx2 = max(0, min(W - 1, fx2)); fy2 = max(0, min(H - 1, fy2))
+                if fx2 > fx1 and fy2 > fy1:
+                    face_roi = frame[fy1:fy2, fx1:fx2]
+                    if face_roi.size > 0:
+                        face_sq = _pad_to_square(face_roi, LB_COLOR[0])
+                        face_224 = cv2.resize(face_sq, (CLS_IMG_SIZE, CLS_IMG_SIZE), interpolation=cv2.INTER_AREA)
+                        # BGR -> RGB for classifier
+                        cls_res = GLASSES_CLS_MODEL.predict(
+                            source=face_224[:, :, ::-1],
+                            imgsz=CLS_IMG_SIZE, device=DEVICE, verbose=False
+                        )[0]
+                        cls_id = int(cls_res.probs.top1)
+                        conf = float(cls_res.probs.top1conf)
+                        top1_name = GLASSES_NAMES.get(cls_id, str(cls_id))
+
+                        has_glasses = (cls_id == WITH_ID) and (conf >= GLASSES_CONF_THRESH)
+                        result["glasses_detected"] = bool(has_glasses)
+                        result["glasses_top1"] = top1_name
+                        result["glasses_conf"] = round(conf, 4)
+                    else:
+                        result["glasses_detected"] = None
+                else:
+                    result["glasses_detected"] = None
+            else:
+                result["glasses_detected"] = None
+        except Exception as e:
+            print("⚠️ Glasses classification error:", e)
+            result["glasses_detected"] = None
     else:
         result["glasses_detected"] = False
 
