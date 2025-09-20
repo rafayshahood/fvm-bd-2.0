@@ -1,4 +1,3 @@
-# onlanders.video.py
 # -------------------------------------------------
 # Video analysis utilities
 # -------------------------------------------------
@@ -14,11 +13,23 @@ import numpy as np
 import torch
 from ultralytics import YOLO
 
+# ▼ NEW: MediaPipe for front-facing check
+import mediapipe as mp
+mp_face_mesh = mp.solutions.face_mesh
+# persistent instance (same params as your script)
+_FACE_MESH = mp_face_mesh.FaceMesh(
+    refine_landmarks=True,
+    min_detection_confidence=0.6,
+    min_tracking_confidence=0.6
+)
+
 # ---- Feature flags (toggle checks) ----
 CHECKS = {
     "face":       bool(int(os.getenv("CHECK_FACE", "1"))),
     "ellipse":    bool(int(os.getenv("CHECK_ELLIPSE", "1"))),
     "brightness": bool(int(os.getenv("CHECK_BRIGHTNESS", "1"))),
+    # ▼ NEW: front-facing gate (enabled by default)
+    "frontal":    bool(int(os.getenv("CHECK_FRONTAL", "1"))),
     "spoof":      bool(int(os.getenv("CHECK_SPOOF", "1"))),
     "glasses":    bool(int(os.getenv("CHECK_GLASSES", "1"))),
 }
@@ -124,25 +135,68 @@ def convert_to_mp4(input_path: str | Path, output_dir: str | Path) -> Path:
 
 
 # -------------------------------------------------
+# NEW: Face direction (exactly your script)
+# -------------------------------------------------
+def _lm_to_xy(lm, w, h):
+    return {"x": lm.x * w, "y": lm.y * h}
+
+def _check_face_direction(face_landmarks, w, h):
+    left_eye  = _lm_to_xy(face_landmarks.landmark[33], w, h)
+    right_eye = _lm_to_xy(face_landmarks.landmark[263], w, h)
+    nose      = _lm_to_xy(face_landmarks.landmark[1], w, h)
+
+    eye_dist = np.linalg.norm(
+        np.array([right_eye["x"], right_eye["y"]]) -
+        np.array([left_eye["x"],  left_eye["y"]])
+    )
+
+    eye_mid_y = (left_eye["y"] + right_eye["y"]) / 2
+    adjusted_eye_mid_y = eye_mid_y + eye_dist * 0.3
+
+    nose_midpoint_dist = nose["x"] - (left_eye["x"] + right_eye["x"]) / 2
+    vertical_nose_dist = nose["y"] - adjusted_eye_mid_y
+
+    horiz_tol = eye_dist * 0.15
+    vert_tol  = eye_dist * 0.2
+
+    guidance = None
+    if abs(nose_midpoint_dist) > horiz_tol:
+        guidance = "Move LEFT" if nose_midpoint_dist > 0 else "Move RIGHT"
+    elif abs(vertical_nose_dist) > vert_tol:
+        guidance = "Move UP" if vertical_nose_dist > 0 else "Move DOWN"
+
+    return guidance
+
+
+# -------------------------------------------------
 # LIVE path: per-frame checks for UX gating
 # -------------------------------------------------
 def analyze_frame(frame, ellipse_params=None) -> dict:
     """
-    Returns a dict consumed by the FE. Key changes:
-      * Face is detected on a letterboxed copy (no distortion), bbox mapped back.
-      * Glasses check uses classifier on a square, resized crop of the largest face.
+    Returns a dict consumed by the FE. Order:
+      1) face detection
+      2) inside ellipse
+      3) brightness
+      4) NEW: front-facing via MediaPipe (before spoof/glasses)
+      5) spoof
+      6) glasses
     """
     result = {
         "checks": get_checks(),
         "face_detected": False,
         "num_faces": 0,
         "one_face": True,
-        "largest_bbox": None,           # [x1,y1,x2,y2] in ORIGINAL coords
+        "largest_bbox": None,
         "inside_ellipse": False,
         "brightness_status": None,
-        "glasses_detected": None,       # True if confidently "with_glasses"
-        "glasses_top1": None,           # 'with_glasses' / 'without_glasses'
-        "glasses_conf": None,           # float confidence
+
+        # ▼ NEW fields
+        "front_facing": None,       # True/False after MediaPipe check
+        "front_guidance": None,     # "Move LEFT/RIGHT/UP/DOWN" or "No face detected"
+
+        "glasses_detected": None,
+        "glasses_top1": None,
+        "glasses_conf": None,
         "spoof_is_real": None,
         "spoof_status": None,
     }
@@ -156,7 +210,6 @@ def analyze_frame(frame, ellipse_params=None) -> dict:
         if not det or det.boxes is None or len(det.boxes) == 0:
             return result
 
-        # pick largest by area (in letterbox space), then map that box back
         boxes_lb = det.boxes.xyxy.detach().cpu().numpy()
         areas = (boxes_lb[:, 2] - boxes_lb[:, 0]) * (boxes_lb[:, 3] - boxes_lb[:, 1])
         bx_lb = boxes_lb[areas.argmax()]
@@ -167,13 +220,11 @@ def analyze_frame(frame, ellipse_params=None) -> dict:
         result["one_face"] = (len(boxes_lb) == 1)
         result["largest_bbox"] = [float(x1), float(y1), float(x2), float(y2)]
     else:
-        # If face-check disabled, pretend one face present
         result["face_detected"] = True
         result["num_faces"] = 1
         result["one_face"] = True
-        # NOTE: largest_bbox stays None if we truly skip face detection
 
-    # 2) Inside ellipse (uses mapped-back bbox)
+    # 2) Inside ellipse
     if CHECKS["ellipse"]:
         if ellipse_params is None or result["largest_bbox"] is None:
             return result
@@ -199,7 +250,7 @@ def analyze_frame(frame, ellipse_params=None) -> dict:
     else:
         result["inside_ellipse"] = True
 
-    # 3) Brightness (whole frame)
+    # 3) Brightness
     if CHECKS["brightness"]:
         mean_b = float(np.mean(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)))
         if mean_b < 50:
@@ -210,7 +261,29 @@ def analyze_frame(frame, ellipse_params=None) -> dict:
     else:
         result["brightness_status"] = "ok"
 
-    # 4) Anti-spoof (unchanged)
+    # 4) NEW: Front-facing (MediaPipe), exact logic from your script
+    if CHECKS["frontal"]:
+        try:
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            mp_res = _FACE_MESH.process(rgb_frame)
+            if mp_res.multi_face_landmarks:
+                # take first face landmarks
+                face_landmarks = mp_res.multi_face_landmarks[0]
+                guidance = _check_face_direction(face_landmarks, W, H)
+                result["front_guidance"] = guidance
+                result["front_facing"] = (guidance is None)
+                if not result["front_facing"]:
+                    # gate here (before spoof/glasses)
+                    return result
+            else:
+                result["front_facing"] = False
+                result["front_guidance"] = "No face detected"
+                return result
+        except Exception as e:
+            # if MediaPipe errors, leave fields None and continue (non-fatal)
+            print("⚠️ Front-facing check error:", e)
+
+    # 5) Anti-spoof
     if CHECKS["spoof"]:
         try:
             image_bbox = spoof_model.get_bbox(frame)
@@ -234,7 +307,7 @@ def analyze_frame(frame, ellipse_params=None) -> dict:
         result["spoof_is_real"] = None
         result["spoof_status"] = "disabled"
 
-    # 5) Glasses classification (uses face crop -> square -> 224 -> classifier)
+    # 6) Glasses classification
     if CHECKS["glasses"]:
         try:
             if result["largest_bbox"] is not None:
@@ -246,7 +319,6 @@ def analyze_frame(frame, ellipse_params=None) -> dict:
                     if face_roi.size > 0:
                         face_sq = _pad_to_square(face_roi, LB_COLOR[0])
                         face_224 = cv2.resize(face_sq, (CLS_IMG_SIZE, CLS_IMG_SIZE), interpolation=cv2.INTER_AREA)
-                        # BGR -> RGB for classifier
                         cls_res = GLASSES_CLS_MODEL.predict(
                             source=face_224[:, :, ::-1],
                             imgsz=CLS_IMG_SIZE, device=DEVICE, verbose=False
