@@ -83,9 +83,9 @@ def run_verif(id_image_path: str, frames_dir: str, output_path: str):
     average_score = sum(s for _, s in scores) / len(scores)
 
     # Determine verification status
-    if best_match_score >= 0.58 and average_score >= 0.53:
+    if best_match_score >= 0.4 and average_score >= 0.36:
         status = '✅ Verified'
-    elif (average_score >= 0.38) and (average_score < 0.53):
+    elif (average_score >= 0.24) and (average_score < 0.36):
         status = '🟡 Needs Manual Review'
     else:
         status = '❌ Unverified'
