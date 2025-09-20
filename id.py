@@ -33,39 +33,43 @@ ID_WEIGHTS_PATH = "iddetection.pt"   # put your trained weights here
 ID_MODEL = YOLO(ID_WEIGHTS_PATH).to(DEVICE)
 
 # -----------------------------------------------------------------------------
-# Config
+# Config (env-tunable where noted)
 # -----------------------------------------------------------------------------
-# Frame brightness thresholds
-BRIGHT_LOW: float  = 60.0
-BRIGHT_HIGH: float = 180.0
+# Frame brightness thresholds (env: ID_FRAME_BRIGHT_LOW / ID_FRAME_BRIGHT_HIGH)
+BRIGHT_LOW: float  = float(os.getenv("ID_FRAME_BRIGHT_LOW",  "40"))
+BRIGHT_HIGH: float = float(os.getenv("ID_FRAME_BRIGHT_HIGH", "200"))
 
-# Face-ROI brightness (advisory only; no longer a hard gate)
-FACE_BRIGHT_LOW: float  = 80.0
-FACE_BRIGHT_HIGH: float = 175.0
+# Face-ROI brightness (advisory only; env: ID_FACE_BRIGHT_LOW / ID_FACE_BRIGHT_HIGH)
+FACE_BRIGHT_LOW: float  = float(os.getenv("ID_FACE_BRIGHT_LOW",  "60"))
+FACE_BRIGHT_HIGH: float = float(os.getenv("ID_FACE_BRIGHT_HIGH", "200"))
 FACE_PAD_RATIO_X: float = 0.15
 FACE_PAD_RATIO_Y: float = 0.15
 
 # Overlay rectangle (keep aligned with FE)
-RECT_W_RATIO: float = 0.90
-RECT_H_RATIO: float = 0.30
+RECT_W_RATIO: float = 0.95
+RECT_H_RATIO: float = 0.45
 
 # Tolerance (accept small over/under)
 RECT_TOL_FRAC: float = 0.08   # allow ~8% margin for "inside rectangle"
 IN_ID_TOL_FRAC: float = 0.06  # allow ~6% margin for "face inside ID"
 
 # Size gates (avoid “too small” faces/ID)
-MIN_ID_W_RATIO: float = 0.1  # ID box must fill at least 55% of frame width
-MIN_FACE_W_PX: int    = 10   # face bbox min width in pixels
+MIN_ID_W_RATIO: float = 0.55  # ID box must fill at least 55% of frame width
+MIN_FACE_W_PX: int    = 80  # face bbox min width in pixels (after selection)
 
 # Output crop padding (still used when we save the ID face)
 CROP_PAD_X: float = 0.20
 CROP_PAD_Y: float = 0.20
 
-# ID-card detector settings
+# Detector settings
 ID_IMG_SIZE: int = 640
-ID_CONF_THRESH: float = 0.75
+ID_CONF_THRESH: float = float(os.getenv("ID_CARD_CONF", "0.75"))
 ID_CARDS_CLASS_INDEX: int = 0   # "Cards" class
 LB_COLOR = (114, 114, 114)
+
+# NEW: Face confidence threshold (env: ID_FACE_CONF)
+FACE_IMG_SIZE: int = 640
+FACE_CONF_THRESH: float = float(os.getenv("ID_FACE_CONF", "0.05"))
 
 # -----------------------------------------------------------------------------
 # Enhancement
@@ -112,14 +116,6 @@ def _brightness_status(bgr_img: np.ndarray) -> Tuple[str, float]:
     if mean_val < BRIGHT_LOW:  return "too_dark", mean_val
     if mean_val > BRIGHT_HIGH: return "too_bright", mean_val
     return "ok", mean_val
-
-def _largest_face_bbox(bgr_img: np.ndarray) -> Optional[np.ndarray]:
-    det = FACE_MODEL.predict(source=[bgr_img], imgsz=640, device=DEVICE, verbose=False)[0]
-    if det is None or len(det.boxes) == 0:
-        return None
-    boxes = det.boxes.xyxy.detach().cpu().numpy()
-    areas = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
-    return boxes[areas.argmax()].astype(float)
 
 def _center_rect_for_image(w: int, h: int, w_ratio: float = RECT_W_RATIO, h_ratio: float = RECT_H_RATIO):
     rw = w * float(w_ratio); rh = h * float(h_ratio)
@@ -222,8 +218,30 @@ def _detect_id_card(bgr_img: np.ndarray) -> Tuple[bool, Optional[Tuple[float,flo
         return False, None, None
     return True, best[0], best[1]
 
+# --- NEW: face detection helpers (return ALL faces with conf) ---
+def _all_face_bboxes(bgr_img: np.ndarray, conf_thresh: float = FACE_CONF_THRESH) -> List[Tuple[np.ndarray, float]]:
+    """
+    Returns list of (bbox_xyxy[np.float32(4)], conf) in ORIGINAL coords, filtered by conf.
+    """
+    lb, r, pad = _letterbox_square(bgr_img, size=FACE_IMG_SIZE, color=LB_COLOR)
+    det = FACE_MODEL.predict(source=[lb], imgsz=FACE_IMG_SIZE, device=DEVICE, verbose=False)[0]
+    faces: List[Tuple[np.ndarray, float]] = []
+    if not det or det.boxes is None or len(det.boxes) == 0:
+        return faces
+    for b in det.boxes:
+        conf = float(getattr(b, "conf", [1.0])[0])  # some face models may lack conf; assume 1.0
+        if conf < conf_thresh:
+            continue
+        x1, y1, x2, y2 = b.xyxy[0].tolist()
+        bx = np.array(_map_box_back((x1, y1, x2, y2), r, pad, bgr_img.shape[1], bgr_img.shape[0]), dtype=float)
+        faces.append((bx, conf))
+    return faces
+
+def _area(bx: np.ndarray) -> float:
+    return max(0.0, (bx[2] - bx[0])) * max(0.0, (bx[3] - bx[1]))
+
 # -----------------------------------------------------------------------------
-# Public API (NEW order)
+# Public API (NEW order + "face inside ID" selection)
 # -----------------------------------------------------------------------------
 def analyze_id_frame(
     image_bgr: np.ndarray,
@@ -232,14 +250,13 @@ def analyze_id_frame(
     rect_h_ratio: float = RECT_H_RATIO,
 ) -> Dict[str, Optional[object]]:
     """
-    New strict order:
+    Order:
       1) overall frame brightness
       2) ID card present
       3) ID card inside the center rectangle (with tolerance)
-      4) face present
-      5) face inside ID-card bbox (with tolerance)
-      6) size / proximity check (ID fill + min face px)
-      7) glare (advisory gate at the end)
+      4) faces present → choose the largest face INSIDE the ID-card bbox (with tolerance)
+      5) size / proximity check (ID fill + min face px)
+      6) advisory: face ROI brightness + glare
     """
     H, W = image_bgr.shape[:2]
     out: Dict[str, Optional[object]] = {
@@ -252,7 +269,7 @@ def analyze_id_frame(
         "id_inside_rect": None,
 
         "face_detected": False,
-        "largest_bbox": None,
+        "largest_bbox": None,   # now: the chosen face INSIDE the ID
         "face_inside_id": None,
 
         "id_fill_ratio": None,
@@ -291,22 +308,29 @@ def analyze_id_frame(
         if not out["id_inside_rect"]:
             return out
 
-    # 4) Face present
-    face_bbox = _largest_face_bbox(image_bgr)
-    if face_bbox is None:
+    # 4) Faces present → choose the largest face INSIDE the ID bbox (with tolerance)
+    faces = _all_face_bboxes(image_bgr, FACE_CONF_THRESH)
+    if len(faces) == 0:
         return out
-    out["face_detected"] = True
-    out["largest_bbox"] = [float(v) for v in face_bbox]
 
-    # 5) Face inside ID-card (with tolerance)
     id_expanded = _bbox_expand_frac(id_bbox, IN_ID_TOL_FRAC)
-    out["face_inside_id"] = _bbox_contains_bbox(id_expanded, face_bbox)
-    if not out["face_inside_id"]:
+    faces_in_id = [(bx, conf) for (bx, conf) in faces if _bbox_contains_bbox(id_expanded, bx)]
+
+    if len(faces_in_id) == 0:
+        # No face inside the ID → treat as fail for ID step (your real face in frame won't block this anymore)
+        out["face_detected"] = False
+        out["face_inside_id"] = False
         return out
 
-    # 6) Size / proximity checks
+    # pick the largest face among those inside the ID
+    chosen_bbox, chosen_conf = max(faces_in_id, key=lambda t: _area(t[0]))
+    out["face_detected"] = True
+    out["largest_bbox"] = [float(v) for v in chosen_bbox]
+    out["face_inside_id"] = True
+
+    # 5) Size / proximity checks
     id_w = float(id_bbox[2] - id_bbox[0])
-    face_w = float(face_bbox[2] - face_bbox[0])
+    face_w = float(chosen_bbox[2] - chosen_bbox[0])
     id_fill_ratio = id_w / max(1.0, float(W))
     out["id_fill_ratio"] = round(id_fill_ratio, 4)
     out["id_fill_ok"] = bool(id_fill_ratio >= MIN_ID_W_RATIO)
@@ -317,19 +341,20 @@ def analyze_id_frame(
     if not (out["id_fill_ok"] and out["face_size_ok"]):
         return out
 
-    # 7) Advisory: face ROI brightness + glare
-    f_status, f_mean = _face_brightness_status(image_bgr, face_bbox)
+    # 6) Advisory: face ROI brightness + glare
+    f_status, f_mean = _face_brightness_status(image_bgr, chosen_bbox)
     out["face_brightness_status"] = f_status
     out["face_brightness_mean"] = float(f_mean)
 
-    roi_for_glare = _roi_from_bbox(image_bgr, face_bbox, 0.15, 0.15)
+    roi_for_glare = _roi_from_bbox(image_bgr, chosen_bbox, 0.15, 0.15)
     out["glare_detected"] = _glare_flags(roi_for_glare)
 
     return out
 
 def run_id_extraction(input_path: str, output_path: str) -> None:
     """
-    Detect largest face, pad, crop, and save to output_path.
+    Detect face in the uploaded ID still and save a padded crop.
+    (Here we expect the upload to already be an ID ROI; we still pick the largest face.)
     """
     out_path = Path(output_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -338,9 +363,12 @@ def run_id_extraction(input_path: str, output_path: str) -> None:
     if image is None:
         raise FileNotFoundError(f"ID image not found at path: {input_path}")
 
-    bbox = _largest_face_bbox(image)
-    if bbox is None:
+    faces = _all_face_bboxes(image, FACE_CONF_THRESH)
+    if len(faces) == 0:
         raise Exception("❌ No face detected in ID image.")
+
+    # choose largest by area
+    bbox = max((bx for (bx, _c) in faces), key=_area)
     x1_f, y1_f, x2_f, y2_f = map(int, bbox)
 
     h, w = image.shape[:2]
