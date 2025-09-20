@@ -108,7 +108,7 @@ wget https://huggingface.co/Deressa/GenConViT/resolve/main/genconvit_vae_inferen
 ### Step 8: Download Image Enhancement Model Weights
 From the main repo folder:
 ```bash
- mkdir -p GFPGAN/experiments/pretrained_models
+ git clone https://github.com/TencentARC/GFPGAN.git
  gdown 1jHlpgqZxYsbHrreKcDgG_qKYX01EuqZw -O GFPGAN/experiments/pretrained_models/GFPGANv1.3.pth
 ```
 
