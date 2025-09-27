@@ -1,16 +1,21 @@
-# id.py
+# id.py — shared analyzers for front and back sides of ID
+# Front: same as before (brightness → ID-in-ROI → overlap/size/area/ar → FACE-on-ID → OCR)
+# Back:  brightness → ID-in-ROI → overlap/size/area/ar → OCR (NO face gate; different OCR keywords)
+
 from __future__ import annotations
 from pathlib import Path
 from typing import Dict, Optional, Tuple, List
-import os, sys
+import os, sys, re
 
 import cv2
 import numpy as np
 import torch
 from ultralytics import YOLO
-from PIL import Image  # enhancement fallback
+from PIL import Image  # enhancement fallback for FRONT only
+from rapidfuzz import fuzz
+import easyocr
 
-# ---- Optional GFPGAN import (safe) ----
+# ---- Optional GFPGAN import (used by FRONT enhancement helper only) ----
 ENHANCER_AVAILABLE = False
 try:
     sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "GFPGAN")))
@@ -20,59 +25,443 @@ except Exception as _e:
     print("⚠️ GFPGAN not available; will use OpenCV fallback for enhancement.", _e)
 
 # -----------------------------------------------------------------------------
-# Devices & Models
+# Device & Models
 # -----------------------------------------------------------------------------
-DEVICE: str = "cuda" if torch.cuda.is_available() else "cpu"
+def _select_device() -> str:
+    if torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
+
+DEVICE: str = _select_device()
 print(f"🖥️ Using device: {DEVICE.upper()}")
 
-# Face model
-FACE_MODEL = YOLO("yolov8n-face-lindevs.pt").to(DEVICE)
-
-# ID-card model
-ID_WEIGHTS_PATH = "iddetection.pt"   # put your trained weights here
-ID_MODEL = YOLO(ID_WEIGHTS_PATH).to(DEVICE)
+FACE_MODEL = YOLO("yolov8n-face-lindevs.pt")
+ID_MODEL   = YOLO("iddetection.pt")
 
 # -----------------------------------------------------------------------------
-# Config (env-tunable where noted)
+# Config — thresholds / gates
 # -----------------------------------------------------------------------------
-# Frame brightness thresholds (env: ID_FRAME_BRIGHT_LOW / ID_FRAME_BRIGHT_HIGH)
-BRIGHT_LOW: float  = float(os.getenv("ID_FRAME_BRIGHT_LOW",  "40"))
-BRIGHT_HIGH: float = float(os.getenv("ID_FRAME_BRIGHT_HIGH", "200"))
+CONF, IOU, MAX_DETS = 0.50, 0.45, 3
+FACE_CONF = 0.50
 
-# Face-ROI brightness (advisory only; env: ID_FACE_BRIGHT_LOW / ID_FACE_BRIGHT_HIGH)
-FACE_BRIGHT_LOW: float  = float(os.getenv("ID_FACE_BRIGHT_LOW",  "60"))
-FACE_BRIGHT_HIGH: float = float(os.getenv("ID_FACE_BRIGHT_HIGH", "200"))
-FACE_PAD_RATIO_X: float = 0.15
-FACE_PAD_RATIO_Y: float = 0.15
+EXPECTED_AR: float      = float(os.getenv("ID_EXPECTED_AR", "1.586"))
+AR_TOL: float           = float(os.getenv("ID_AR_TOL", "0.18"))
+MIN_AREA_FRAC: float    = float(os.getenv("ID_MIN_AREA_FRAC", "0.02"))
 
-# Overlay rectangle (keep aligned with FE)
+OVERLAP_MIN: float           = float(os.getenv("ID_OVERLAP_MIN", "0.60"))
+OCR_BOX_KEEP_PCT: float      = float(os.getenv("ID_OCR_KEEP_PCT", "0.90"))
+MIN_GUIDE_COVER_FRAC: float  = float(os.getenv("ID_MIN_GUIDE_COVER", "0.30"))
+
+# OCR thresholds (relaxed for international compatibility)
+OCR_REQUIRED_HITS: int  = int(os.getenv("ID_OCR_HITS", "1"))      # Reduced from 2
+OCR_MIN_CONF: float     = float(os.getenv("ID_OCR_MIN_CONF", "0.45"))  # Reduced from 0.55
+FUZZY: int              = int(os.getenv("ID_OCR_FUZZY", "70"))     # Reduced from 75
+
+# Brightness thresholds
+BRIGHT_MIN: int = int(os.getenv("ID_BRIGHT_MIN", "60"))
+BRIGHT_MAX: int = int(os.getenv("ID_BRIGHT_MAX", "220"))
+
+ID_IMG_SIZE: int = 640
+LB_COLOR = (114,114,114)
+
+# Guide rectangle (must match FE)
 RECT_W_RATIO: float = 0.95
 RECT_H_RATIO: float = 0.45
 
-# Tolerance (accept small over/under)
-RECT_TOL_FRAC: float = 0.08   # allow ~8% margin for "inside rectangle"
-IN_ID_TOL_FRAC: float = 0.06  # allow ~6% margin for "face inside ID"
-
-# Size gates (avoid “too small” faces/ID)
-MIN_ID_W_RATIO: float = 0.55  # ID box must fill at least 55% of frame width
-MIN_FACE_W_PX: int    = 80  # face bbox min width in pixels (after selection)
-
-# Output crop padding (still used when we save the ID face)
-CROP_PAD_X: float = 0.20
-CROP_PAD_Y: float = 0.20
-
-# Detector settings
-ID_IMG_SIZE: int = 640
-ID_CONF_THRESH: float = float(os.getenv("ID_CARD_CONF", "0.75"))
-ID_CARDS_CLASS_INDEX: int = 0   # "Cards" class
-LB_COLOR = (114, 114, 114)
-
-# NEW: Face confidence threshold (env: ID_FACE_CONF)
-FACE_IMG_SIZE: int = 640
-FACE_CONF_THRESH: float = float(os.getenv("ID_FACE_CONF", "0.05"))
+# EasyOCR with multi-language support - dual reader approach for language constraints
+_EASYOCR_USE_GPU = bool(torch.cuda.is_available())
+reader_primary = easyocr.Reader(['en','es'], gpu=_EASYOCR_USE_GPU)  # English + Spanish
+reader_urdu = easyocr.Reader(['en','ur'], gpu=_EASYOCR_USE_GPU)     # English + Urdu
 
 # -----------------------------------------------------------------------------
-# Enhancement
+# OCR keyword/regex sets (FRONT & BACK)
+# -----------------------------------------------------------------------------
+KW_FRONT = [
+    # Spanish + English generic front-of-ID terms
+    "identidad","identificación","cédula","ciudadanía","república","colombia","nacional",
+    "autoridad","expedición","vencimiento","sexo","nombre","apellidos","nuip",
+    "identity","identification","id card","national","authority","republic","government","passport"
+]
+RGX_FRONT = [
+    r"\b\d{6,}\b",  # long numerics
+    r"\b(19|20)\d{2}[./\- ]\d{1,2}[./\- ]\d{1,2}\b",  # YYYY-MM-DD variants
+    r"\b\d{1,2}\s*(ene|feb|mar|abr|may|jun|jul|ago|sep|oct|nov|dic|"
+    r"jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\s*(19|20)\d{2}\b",
+    r"\b(NUIP|N\.U\.I\.P\.?)\b",
+    r"\b\d{1,3}\.\d{3}\.\d{3}\.\d{1,4}\b"
+]
+
+# Enhanced back-side keywords (Pakistani + Colombian + International)
+KW_BACK = [
+    # Pakistani CNIC terms (English & transliterated Urdu)
+    "cnic", "computerized", "national", "identity", "card", "pakistan", "pakistani",
+    "nadra", "authority", "registration", "database", "islamic", "republic",
+    "date of birth", "date of issue", "date of expiry", "signature", "holder",
+    "father", "husband", "address", "district", "province", "tehsil",
+    
+    # Colombian Cedula terms (Spanish)
+    "registraduría", "registraduria", "nacional del estado civil", "república", "colombia",
+    "expedición", "lugar de expedición", "fecha de expedición", "vigencia",
+    "firma", "huella", "grupo sanguíneo", "rh", "observaciones",
+    
+    # Generic international ID terms (English/Spanish)
+    "documento", "document", "autoridad", "authority", "número", "number", "serial",
+    "barcode", "qr", "code", "identification", "citizen", "residency", "passport",
+    "government", "official", "valid", "expires", "issued", "birth", "sex", "gender",
+    "male", "female", "masculino", "femenino", "hombre", "mujer",
+    
+    # Address-related terms (multiple languages)
+    "address", "dirección", "domicilio", "residence", "location", "city", "ciudad",
+    "state", "estado", "country", "país", "postal", "zip", "code",
+    
+    # Common ID elements
+    "photo", "picture", "imagen", "photograph", "security", "seguridad",
+    "features", "características", "watermark", "hologram", "chip",
+    
+    # Blood type variations
+    "blood", "sangre", "tipo", "type", "group", "grupo", "rh+", "rh-", "o+", "o-", "a+", "a-", "b+", "b-", "ab+", "ab-",
+]
+
+# Enhanced regex patterns for international coverage
+RGX_BACK = [
+    # Long numeric sequences (ID numbers, CNIC numbers)
+    r"\b\d{6,}\b",
+    r"\b\d{5}-\d{7}-\d{1}\b",  # Pakistani CNIC format (12345-1234567-1)
+    r"\b\d{2,3}\.\d{3}\.\d{3}[-.]?\d{1,4}\b",  # Colombian format variations
+    
+    # Date patterns (multiple formats)
+    r"\b(19|20)\d{2}[./\-]\d{1,2}[./\-]\d{1,2}\b",  # YYYY-MM-DD variants
+    r"\b\d{1,2}[./\-]\d{1,2}[./\-](19|20)\d{2}\b",  # DD-MM-YYYY variants
+    r"\b\d{1,2}[./\-](19|20)\d{2}\b",  # MM-YYYY variants
+    
+    # Month name patterns (English/Spanish)
+    r"\b\d{1,2}\s*(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|"
+    r"ene|feb|mar|abr|may|jun|jul|ago|sep|oct|nov|dic)\s*(19|20)\d{2}\b",
+    
+    # Pakistani specific patterns
+    r"\b(CNIC|C\.N\.I\.C\.?)\b",
+    r"\b(NADRA|N\.A\.D\.R\.A\.?)\b",
+    r"\b(S/O|D/O|W/O)\b",  # Son/Daughter/Wife of
+    r"\b\d{5}-\d{7}-\d\b",  # CNIC number format
+    
+    # Colombian specific patterns  
+    r"\b(NUIP|N\.U\.I\.P\.?)\b",
+    r"\b(RH|grupo sanguíneo|grupo sanguineo)\b",
+    r"\bserial\s*[#: ]?\s*\w+\b",
+    r"\bregistraduría\s+nacional\b",
+    
+    # Blood type patterns
+    r"\b(A|B|AB|O)[+-]?\b",
+    r"\b(RH|Rh)[+-]?\b",
+    
+    # Generic ID patterns
+    r"\b(ID|I\.D\.?)\s*[:.]?\s*\w+\b",
+    r"\b(No|Num|Number|Número)[:.]?\s*\d+\b",
+    r"\b(Exp|Expires|Expiry|Expiration|Vence|Vigencia)[:.]?\s*\d{1,2}[./\-]\d{1,2}[./\-]\d{2,4}\b",
+    
+    # Security feature patterns
+    r"\b(Security|Seguridad)\s+(Features|Características)\b",
+    r"\b(Watermark|Hologram|Chip)\b",
+]
+
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
+def _center_rect_for_image(w: int, h: int, w_ratio: float = RECT_W_RATIO, h_ratio: float = RECT_H_RATIO):
+    rw = w * float(w_ratio); rh = h * float(h_ratio)
+    return (w - rw) / 2.0, (h - rh) / 2.0, rw, rh  # x,y,w,h (float)
+
+def _letterbox_square(img: np.ndarray, size: int = 640, color=(114,114,114)):
+    h, w = img.shape[:2]
+    r = min(size / w, size / h)
+    new_w, new_h = int(round(w * r)), int(round(h * r))
+    resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    dw, dh = size - new_w, size - new_h
+    left, right = dw // 2, dw - dw // 2
+    top,  bottom = dh // 2, dh - dh // 2
+    out = cv2.copyMakeBorder(resized, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)
+    return out, r, (left, top)
+
+def _map_box_back(xyxy, r, pad, orig_w, orig_h):
+    left, top = pad
+    x1, y1, x2, y2 = xyxy
+    x1 = (x1 - left) / r; y1 = (y1 - top) / r
+    x2 = (x2 - left) / r; y2 = (y2 - top) / r
+    x1 = max(0, min(orig_w - 1, x1)); y1 = max(0, min(orig_h - 1, y1))
+    x2 = max(0, min(orig_w - 1, x2)); y2 = max(0, min(orig_h - 1, y2))
+    return float(x1), float(y1), float(x2), float(y2)
+
+def _rect_intersect(a_xyxy, b_xyxy):
+    ax1, ay1, ax2, ay2 = a_xyxy; bx1, by1, bx2, by2 = b_xyxy
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    if ix2 <= ix1 or iy2 <= iy1:
+        return None, 0.0, 0.0
+    inter = (ix2 - ix1) * (iy2 - iy1)
+    aarea = max(0, ax2 - ax1) * max(0, ay2 - ay1)
+    return (ix1, iy1, ix2, iy2), float(inter) / (aarea + 1e-6), float(inter)
+
+def _aspect_ok(w: float, h: float, exp: float = EXPECTED_AR, tol: float = AR_TOL):
+    if w <= 0 or h <= 0: return False, 0.0
+    ar = w / float(h)
+    return (exp*(1-tol) <= ar <= exp*(1+tol)), ar
+
+def _area_frac_ok(x1: float, y1: float, x2: float, y2: float, W: int, H: int, minf: float = MIN_AREA_FRAC):
+    return ((x2 - x1) * (y2 - y1)) / (W * H + 1e-6) >= minf
+
+def _brightness_eval(img_bgr: np.ndarray):
+    """Return (ok, mean, status) using Y (luma) from YCrCb."""
+    y = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2YCrCb)[:, :, 0]
+    mean = float(np.mean(y))
+    if mean < BRIGHT_MIN:
+        return False, mean, "dark"
+    if mean > BRIGHT_MAX:
+        return False, mean, "bright"
+    return True, mean, "ok"
+
+def _detect_id_card_in_roi(frame_bgr: np.ndarray, guide_xyxy: Tuple[int,int,int,int]):
+    """Detect ONLY inside the guide ROI."""
+    gx1, gy1, gx2, gy2 = guide_xyxy
+    roi = frame_bgr[gy1:gy2, gx1:gx2]
+    if roi.size == 0:
+        return False, None, None
+    H_roi, W_roi = roi.shape[:2]
+    lb, r, pad = _letterbox_square(roi, size=ID_IMG_SIZE, color=LB_COLOR)
+    det = ID_MODEL.predict(source=[lb], imgsz=ID_IMG_SIZE, conf=CONF, iou=IOU,
+                           max_det=MAX_DETS, device=DEVICE, verbose=False)[0]
+    best = None
+    if det and det.boxes is not None and len(det.boxes) > 0:
+        for b in det.boxes:
+            cls = int(b.cls[0]); conf = float(b.conf[0])
+            if cls != 0:
+                continue
+            x1, y1, x2, y2 = b.xyxy[0].tolist()
+            rx1, ry1, rx2, ry2 = _map_box_back((x1, y1, x2, y2), r, pad, W_roi, H_roi)
+            fx1, fy1, fx2, fy2 = gx1 + rx1, gy1 + ry1, gx1 + rx2, gy1 + ry2
+            if best is None or conf > best[1]:
+                best = ((fx1, fy1, fx2, fy2), conf)
+    if best is None:
+        return False, None, None
+    return True, best[0], best[1]
+
+def _detect_face_in_id_crop(id_crop_bgr: np.ndarray, imgsz: int = 320):
+    lb, r, pad = _letterbox_square(id_crop_bgr, size=imgsz, color=LB_COLOR)
+    det = FACE_MODEL.predict(source=[lb], imgsz=imgsz, conf=FACE_CONF, iou=0.45,
+                             max_det=3, device=DEVICE, verbose=False)[0]
+    if not det or det.boxes is None or len(det.boxes) == 0:
+        return False, None
+    (Hc, Wc) = id_crop_bgr.shape[:2]
+    crop_area = float(Hc * Wc) + 1e-6
+    candidates = sorted(det.boxes,
+                        key=lambda bb: float(bb.conf[0]) if getattr(bb, "conf", None) is not None else 1.0,
+                        reverse=True)
+    for b in candidates:
+        x1, y1, x2, y2 = b.xyxy[0].tolist()
+        fx1, fy1, fx2, fy2 = _map_box_back((x1, y1, x2, y2), r, pad, Wc, Hc)
+        if ((fx2 - fx1) * (fy2 - fy1) / crop_area) >= 0.02:
+            return True, (int(fx1), int(fy1), int(fx2), int(fy2))
+    return False, None
+
+def _ocr_verify_crop_inside_custom(
+    crop_bgr: np.ndarray, ix1: int, iy1: int, guide_xyxy, kw_list: List[str], rgx_list: List[str],
+    required_hits: int = OCR_REQUIRED_HITS, min_conf: float = OCR_MIN_CONF, fuzzy: int = FUZZY
+):
+    # Try primary reader (English + Spanish) first
+    res = reader_primary.readtext(crop_bgr, detail=1, paragraph=False)
+    if not res:
+        # Fallback to Urdu reader for Arabic-script text
+        try:
+            res = reader_urdu.readtext(crop_bgr, detail=1, paragraph=False)
+        except Exception:
+            res = []
+            
+    if not res:
+        return False, 0.0, 0, "", 0.0
+    texts, confs, inside = [], [], []
+    gx1, gy1, gx2, gy2 = guide_xyxy
+    for (pts, txt, conf) in res:
+        if not txt:
+            continue
+        cx = sum(p[0] for p in pts) / 4.0 + ix1
+        cy = sum(p[1] for p in pts) / 4.0 + iy1
+        inside.append(gx1 <= cx <= gx2 and gy1 <= cy <= gy2)
+        texts.append(txt); confs.append(float(conf))
+    if not texts:
+        return False, 0.0, 0, "", 0.0
+
+    inside_ratio = (sum(inside) / max(1, len(inside)))
+    if inside_ratio < OCR_BOX_KEEP_PCT:
+        return False, float(np.mean(confs)), 0, " ".join(texts).lower(), inside_ratio
+
+    joined = " ".join(texts).lower()
+    hits = 0
+    for kw in kw_list:
+        if fuzz.partial_ratio(kw, joined) >= fuzzy:
+            hits += 1
+    for rx in rgx_list:
+        if re.search(rx, joined):
+            hits += 1
+    mean_conf = float(np.mean(confs))
+    ok = (hits >= required_hits) and (mean_conf >= min_conf)
+    return ok, mean_conf, hits, joined, inside_ratio
+
+# -----------------------------------------------------------------------------
+# Public analyzers
+# -----------------------------------------------------------------------------
+def analyze_id_frame(
+    image_bgr: np.ndarray,
+    rect_w_ratio: float = RECT_W_RATIO,
+    rect_h_ratio: float = RECT_H_RATIO,
+) -> Dict[str, Optional[object]]:
+    """FRONT side analyzer (unchanged behavior)."""
+    H, W = image_bgr.shape[:2]
+    out: Dict[str, Optional[object]] = {
+        "rect": None, "roi_xyxy": None,
+        "brightness_ok": None, "brightness_status": None, "brightness_mean": None,
+        "id_card_detected": False, "id_card_bbox": None, "id_card_conf": None,
+        "id_frac_in": None, "id_overlap_ok": None,
+        "id_size_ratio": None, "id_size_ok": None,
+        "id_ar": None,
+        "face_on_id": False, "largest_bbox": None,
+        "ocr_ok": None, "ocr_inside_ratio": None, "ocr_hits": None, "ocr_mean_conf": None,
+        "verified": False,
+    }
+
+    # Guide
+    rx, ry, rw, rh = _center_rect_for_image(W, H, rect_w_ratio, rect_h_ratio)
+    gx1, gy1 = int(rx), int(ry); gx2, gy2 = int(rx + rw), int(ry + rh)
+    guide_xyxy = (gx1, gy1, gx2, gy2)
+    out["rect"] = [float(rx), float(ry), float(rw), float(rh)]
+    out["roi_xyxy"] = [gx1, gy1, gx2, gy2]
+
+    # (0) Brightness
+    b_ok, b_mean, b_status = _brightness_eval(image_bgr)
+    out["brightness_ok"] = bool(b_ok)
+    out["brightness_mean"] = float(b_mean)
+    out["brightness_status"] = str(b_status)
+    if not b_ok:
+        return out
+
+    # (1) Detect ID in ROI
+    id_ok, id_bbox, id_conf = _detect_id_card_in_roi(image_bgr, guide_xyxy)
+    out["id_card_detected"] = bool(id_ok)
+    out["id_card_bbox"] = list(id_bbox) if id_bbox else None
+    out["id_card_conf"] = float(id_conf) if id_conf is not None else None
+    if not id_ok:
+        return out
+
+    # Geometry + gates
+    x1, y1, x2, y2 = id_bbox
+    ar_ok, ar = _aspect_ok(x2 - x1, y2 - y1); out["id_ar"] = float(ar)
+    inter, frac_in, inter_area = _rect_intersect(id_bbox, guide_xyxy); out["id_frac_in"] = float(frac_in)
+    if inter is None or frac_in < OVERLAP_MIN: out["id_overlap_ok"] = False; return out
+    out["id_overlap_ok"] = True
+    guide_area = float((gx2 - gx1) * (gy2 - gy1)) + 1e-6
+    size_ratio = inter_area / guide_area; out["id_size_ratio"] = float(size_ratio)
+    out["id_size_ok"] = bool(size_ratio >= MIN_GUIDE_COVER_FRAC)
+    if not out["id_size_ok"]: return out
+    if not _area_frac_ok(x1, y1, x2, y2, W, H): return out
+    if not ar_ok: return out
+
+    # Crop for face+OCR
+    ix1, iy1, ix2, iy2 = map(int, inter)
+    id_crop = image_bgr[iy1:iy2, ix1:ix2]
+
+    # Face-on-ID
+    f_ok, f_box = _detect_face_in_id_crop(id_crop, imgsz=320)
+    out["face_on_id"] = bool(f_ok)
+    if f_ok and f_box is not None:
+        fx1, fy1, fx2, fy2 = f_box
+        out["largest_bbox"] = [ix1 + fx1, iy1 + fy1, ix1 + fx2, iy1 + fy2]
+
+    # OCR (front)
+    ocr_ok, mean_conf, hits, _joined, inside_ratio = _ocr_verify_crop_inside_custom(
+        id_crop, ix1, iy1, guide_xyxy, KW_FRONT, RGX_FRONT, OCR_REQUIRED_HITS, OCR_MIN_CONF, FUZZY
+    )
+    out["ocr_ok"] = bool(ocr_ok)
+    out["ocr_inside_ratio"] = float(inside_ratio)
+    out["ocr_hits"] = int(hits)
+    out["ocr_mean_conf"] = float(mean_conf)
+
+    # Final verdict (front): overlap + size + face + OCR
+    out["verified"] = bool(out["id_overlap_ok"] and out["id_size_ok"] and out["face_on_id"] and out["ocr_ok"])
+    return out
+
+
+def analyze_id_back_frame(
+    image_bgr: np.ndarray,
+    rect_w_ratio: float = RECT_W_RATIO,
+    rect_h_ratio: float = RECT_H_RATIO,
+) -> Dict[str, Optional[object]]:
+    """BACK side analyzer: same gates, NO face gate, OCR uses KW_BACK/RGX_BACK."""
+    H, W = image_bgr.shape[:2]
+    out: Dict[str, Optional[object]] = {
+        "rect": None, "roi_xyxy": None,
+        "brightness_ok": None, "brightness_status": None, "brightness_mean": None,
+        "id_card_detected": False, "id_card_bbox": None, "id_card_conf": None,
+        "id_frac_in": None, "id_overlap_ok": None,
+        "id_size_ratio": None, "id_size_ok": None,
+        "id_ar": None,
+        # No face outputs for back
+        "ocr_ok": None, "ocr_inside_ratio": None, "ocr_hits": None, "ocr_mean_conf": None,
+        "verified": False,
+    }
+
+    # Guide
+    rx, ry, rw, rh = _center_rect_for_image(W, H, rect_w_ratio, rect_h_ratio)
+    gx1, gy1 = int(rx), int(ry); gx2, gy2 = int(rx + rw), int(ry + rh)
+    guide_xyxy = (gx1, gy1, gx2, gy2)
+    out["rect"] = [float(rx), float(ry), float(rw), float(rh)]
+    out["roi_xyxy"] = [gx1, gy1, gx2, gy2]
+
+    # (0) Brightness
+    b_ok, b_mean, b_status = _brightness_eval(image_bgr)
+    out["brightness_ok"] = bool(b_ok)
+    out["brightness_mean"] = float(b_mean)
+    out["brightness_status"] = str(b_status)
+    if not b_ok:
+        return out
+
+    # (1) Detect ID in ROI
+    id_ok, id_bbox, id_conf = _detect_id_card_in_roi(image_bgr, guide_xyxy)
+    out["id_card_detected"] = bool(id_ok)
+    out["id_card_bbox"] = list(id_bbox) if id_bbox else None
+    out["id_card_conf"] = float(id_conf) if id_conf is not None else None
+    if not id_ok:
+        return out
+
+    # Geometry + gates
+    x1, y1, x2, y2 = id_bbox
+    ar_ok, ar = _aspect_ok(x2 - x1, y2 - y1); out["id_ar"] = float(ar)
+    inter, frac_in, inter_area = _rect_intersect(id_bbox, guide_xyxy); out["id_frac_in"] = float(frac_in)
+    if inter is None or frac_in < OVERLAP_MIN: out["id_overlap_ok"] = False; return out
+    out["id_overlap_ok"] = True
+    guide_area = float((gx2 - gx1) * (gy2 - gy1)) + 1e-6
+    size_ratio = inter_area / guide_area; out["id_size_ratio"] = float(size_ratio)
+    out["id_size_ok"] = bool(size_ratio >= MIN_GUIDE_COVER_FRAC)
+    if not out["id_size_ok"]: return out
+    if not _area_frac_ok(x1, y1, x2, y2, W, H): return out
+    if not ar_ok: return out
+
+    # Crop for OCR
+    ix1, iy1, ix2, iy2 = map(int, inter)
+    id_crop = image_bgr[iy1:iy2, ix1:ix2]
+
+    # OCR (back)
+    ocr_ok, mean_conf, hits, _joined, inside_ratio = _ocr_verify_crop_inside_custom(
+        id_crop, ix1, iy1, guide_xyxy, KW_BACK, RGX_BACK, OCR_REQUIRED_HITS, OCR_MIN_CONF, FUZZY
+    )
+    out["ocr_ok"] = bool(ocr_ok)
+    out["ocr_inside_ratio"] = float(inside_ratio)
+    out["ocr_hits"] = int(hits)
+    out["ocr_mean_conf"] = float(mean_conf)
+
+    # Final verdict (back): overlap + size + OCR (no face gate)
+    out["verified"] = bool(out["id_overlap_ok"] and out["id_size_ok"] and out["ocr_ok"])
+    return out
+
+# -----------------------------------------------------------------------------
+# Enhancement & face-crop-on-still (FRONT only; unchanged)
 # -----------------------------------------------------------------------------
 def enhance_id_image(input_path: str, output_path: str) -> bool:
     if ENHANCER_AVAILABLE:
@@ -107,255 +496,7 @@ def enhance_id_image(input_path: str, output_path: str) -> bool:
     print(f"✅ Enhanced (OpenCV) saved to {output_path}")
     return True
 
-# -----------------------------------------------------------------------------
-# Helpers
-# -----------------------------------------------------------------------------
-def _brightness_status(bgr_img: np.ndarray) -> Tuple[str, float]:
-    gray = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2GRAY)
-    mean_val = float(np.mean(gray))
-    if mean_val < BRIGHT_LOW:  return "too_dark", mean_val
-    if mean_val > BRIGHT_HIGH: return "too_bright", mean_val
-    return "ok", mean_val
-
-def _center_rect_for_image(w: int, h: int, w_ratio: float = RECT_W_RATIO, h_ratio: float = RECT_H_RATIO):
-    rw = w * float(w_ratio); rh = h * float(h_ratio)
-    # return x, y, w, h
-    return (w - rw) / 2.0, (h - rh) / 2.0, rw, rh
-
-def _expand_rect(rect_xywh, frac: float):
-    rx, ry, rw, rh = rect_xywh
-    ex = rw * frac; ey = rh * frac
-    return (rx - ex, ry - ey, rw + 2*ex, rh + 2*ey)
-
-def _rect_contains_bbox(rect_xywh, bbox_xyxy) -> bool:
-    rx, ry, rw, rh = rect_xywh
-    x1, y1, x2, y2 = bbox_xyxy
-    def inside(px, py): return (rx <= px <= rx + rw) and (ry <= py <= ry + rh)
-    return all(inside(px, py) for px, py in [(x1,y1),(x2,y1),(x1,y2),(x2,y2)])
-
-def _bbox_contains_bbox(outer_xyxy, inner_xyxy) -> bool:
-    ox1, oy1, ox2, oy2 = outer_xyxy
-    ix1, iy1, ix2, iy2 = inner_xyxy
-    return (ox1 <= ix1) and (oy1 <= iy1) and (ox2 >= ix2) and (oy2 >= iy2)
-
-def _bbox_expand_frac(bbox_xyxy, frac: float):
-    x1, y1, x2, y2 = bbox_xyxy
-    w, h = (x2 - x1), (y2 - y1)
-    dx, dy = w * frac, h * frac
-    return (x1 - dx, y1 - dy, x2 + dx, y2 + dy)
-
-def _roi_from_bbox(img: np.ndarray, bbox: np.ndarray,
-                   pad_x_ratio: float = FACE_PAD_RATIO_X,
-                   pad_y_ratio: float = FACE_PAD_RATIO_Y) -> np.ndarray:
-    H, W = img.shape[:2]
-    x1, y1, x2, y2 = map(int, bbox)
-    px = int((x2 - x1) * pad_x_ratio); py = int((y2 - y1) * pad_y_ratio)
-    xi1 = max(0, x1 - px); yi1 = max(0, y1 - py)
-    xi2 = min(W - 1, x2 + px); yi2 = min(H - 1, y2 + py)
-    return img[yi1:yi2, xi1:xi2]
-
-def _face_brightness_status(image_bgr: np.ndarray, bbox: np.ndarray) -> Tuple[str, float]:
-    roi = _roi_from_bbox(image_bgr, bbox, FACE_PAD_RATIO_X, FACE_PAD_RATIO_Y)
-    if roi is None or roi.size == 0:
-        return "too_dark", 0.0
-    mean_val = float(np.mean(cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)))
-    if mean_val < FACE_BRIGHT_LOW:  return "too_dark", mean_val
-    if mean_val > FACE_BRIGHT_HIGH: return "too_bright", mean_val
-    return "ok", mean_val
-
-def _glare_flags(bgr_roi: np.ndarray) -> bool:
-    if bgr_roi is None or bgr_roi.size == 0:
-        return False
-    gray = cv2.cvtColor(bgr_roi, cv2.COLOR_BGR2GRAY)
-    hsv  = cv2.cvtColor(bgr_roi, cv2.COLOR_BGR2HSV)
-    _, S, V = cv2.split(hsv)
-    N = gray.size
-    pct_clipped  = float((gray >= 250).sum()) / max(1, N)
-    pct_specular = float(((V >= 240) & (S <= 40)).sum()) / max(1, N)
-    mean_g = float(np.mean(gray)); std_g = float(np.std(gray))
-    return (pct_clipped > 0.03) or (pct_specular > 0.08) or (std_g < 18 and mean_g > 180)
-
-# --- Letterbox helpers for ID-card detector ---
-def _letterbox_square(img: np.ndarray, size: int = 640, color=(114,114,114)):
-    h, w = img.shape[:2]
-    r = min(size / w, size / h)
-    new_w, new_h = int(round(w * r)), int(round(h * r))
-    resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-    dw, dh = size - new_w, size - new_h
-    left, right = dw // 2, dw - dw // 2
-    top, bottom = dh // 2, dh - dh // 2
-    out = cv2.copyMakeBorder(resized, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)
-    return out, r, (left, top)
-
-def _map_box_back(xyxy, r, pad, orig_w, orig_h):
-    left, top = pad
-    x1, y1, x2, y2 = xyxy
-    x1 = (x1 - left) / r; y1 = (y1 - top) / r
-    x2 = (x2 - left) / r; y2 = (y2 - top) / r
-    x1 = max(0, min(orig_w - 1, x1)); y1 = max(0, min(orig_h - 1, y1))
-    x2 = max(0, min(orig_w - 1, x2)); y2 = max(0, min(orig_h - 1, y2))
-    return float(x1), float(y1), float(x2), float(y2)
-
-def _detect_id_card(bgr_img: np.ndarray) -> Tuple[bool, Optional[Tuple[float,float,float,float]], Optional[float]]:
-    """
-    Returns: (detected, bbox_xyxy, conf) in ORIGINAL frame coords.
-    Only accepts class == ID_CARDS_CLASS_INDEX and conf >= ID_CONF_THRESH.
-    """
-    H, W = bgr_img.shape[:2]
-    lb, r, pad = _letterbox_square(bgr_img, size=ID_IMG_SIZE, color=LB_COLOR)
-    res = ID_MODEL.predict(source=[lb], imgsz=ID_IMG_SIZE, conf=ID_CONF_THRESH,
-                           device=DEVICE, verbose=False)[0]
-    best = None
-    if res and res.boxes is not None and len(res.boxes) > 0:
-        for b in res.boxes:
-            cls = int(b.cls[0]); conf = float(b.conf[0])
-            if cls == ID_CARDS_CLASS_INDEX and conf >= ID_CONF_THRESH:
-                if (best is None) or (conf > best[1]):
-                    x1, y1, x2, y2 = b.xyxy[0].tolist()
-                    bx = _map_box_back((x1, y1, x2, y2), r, pad, W, H)
-                    best = (bx, conf)
-    if best is None:
-        return False, None, None
-    return True, best[0], best[1]
-
-# --- NEW: face detection helpers (return ALL faces with conf) ---
-def _all_face_bboxes(bgr_img: np.ndarray, conf_thresh: float = FACE_CONF_THRESH) -> List[Tuple[np.ndarray, float]]:
-    """
-    Returns list of (bbox_xyxy[np.float32(4)], conf) in ORIGINAL coords, filtered by conf.
-    """
-    lb, r, pad = _letterbox_square(bgr_img, size=FACE_IMG_SIZE, color=LB_COLOR)
-    det = FACE_MODEL.predict(source=[lb], imgsz=FACE_IMG_SIZE, device=DEVICE, verbose=False)[0]
-    faces: List[Tuple[np.ndarray, float]] = []
-    if not det or det.boxes is None or len(det.boxes) == 0:
-        return faces
-    for b in det.boxes:
-        conf = float(getattr(b, "conf", [1.0])[0])  # some face models may lack conf; assume 1.0
-        if conf < conf_thresh:
-            continue
-        x1, y1, x2, y2 = b.xyxy[0].tolist()
-        bx = np.array(_map_box_back((x1, y1, x2, y2), r, pad, bgr_img.shape[1], bgr_img.shape[0]), dtype=float)
-        faces.append((bx, conf))
-    return faces
-
-def _area(bx: np.ndarray) -> float:
-    return max(0.0, (bx[2] - bx[0])) * max(0.0, (bx[3] - bx[1]))
-
-# -----------------------------------------------------------------------------
-# Public API (NEW order + "face inside ID" selection)
-# -----------------------------------------------------------------------------
-def analyze_id_frame(
-    image_bgr: np.ndarray,
-    use_auto_rect: bool = True,
-    rect_w_ratio: float = RECT_W_RATIO,
-    rect_h_ratio: float = RECT_H_RATIO,
-) -> Dict[str, Optional[object]]:
-    """
-    Order:
-      1) overall frame brightness
-      2) ID card present
-      3) ID card inside the center rectangle (with tolerance)
-      4) faces present → choose the largest face INSIDE the ID-card bbox (with tolerance)
-      5) size / proximity check (ID fill + min face px)
-      6) advisory: face ROI brightness + glare
-    """
-    H, W = image_bgr.shape[:2]
-    out: Dict[str, Optional[object]] = {
-        "brightness_status": None,
-        "brightness_mean": None,
-
-        "id_card_detected": None,
-        "id_card_bbox": None,
-        "id_card_conf": None,
-        "id_inside_rect": None,
-
-        "face_detected": False,
-        "largest_bbox": None,   # now: the chosen face INSIDE the ID
-        "face_inside_id": None,
-
-        "id_fill_ratio": None,
-        "id_fill_ok": None,
-        "face_w_px": None,
-        "face_size_ok": None,
-
-        "face_brightness_status": None,  # advisory only
-        "face_brightness_mean": None,
-
-        "rect": None,
-        "glare_detected": False,
-    }
-
-    # 1) Frame brightness
-    b_status, b_mean = _brightness_status(image_bgr)
-    out["brightness_status"] = b_status
-    out["brightness_mean"] = float(b_mean)
-    if b_status != "ok":
-        return out
-
-    # 2) ID card present
-    id_ok, id_bbox, id_conf = _detect_id_card(image_bgr)
-    out["id_card_detected"] = bool(id_ok)
-    out["id_card_bbox"] = list(id_bbox) if id_bbox else None
-    out["id_card_conf"] = float(id_conf) if id_conf is not None else None
-    if not id_ok:
-        return out
-
-    # 3) ID inside center rectangle (with tolerance)
-    if use_auto_rect:
-        rect = _center_rect_for_image(W, H, rect_w_ratio, rect_h_ratio)
-        out["rect"] = [float(r) for r in rect]
-        rect_expanded = _expand_rect(rect, RECT_TOL_FRAC)
-        out["id_inside_rect"] = _rect_contains_bbox(rect_expanded, id_bbox)
-        if not out["id_inside_rect"]:
-            return out
-
-    # 4) Faces present → choose the largest face INSIDE the ID bbox (with tolerance)
-    faces = _all_face_bboxes(image_bgr, FACE_CONF_THRESH)
-    if len(faces) == 0:
-        return out
-
-    id_expanded = _bbox_expand_frac(id_bbox, IN_ID_TOL_FRAC)
-    faces_in_id = [(bx, conf) for (bx, conf) in faces if _bbox_contains_bbox(id_expanded, bx)]
-
-    if len(faces_in_id) == 0:
-        # No face inside the ID → treat as fail for ID step (your real face in frame won't block this anymore)
-        out["face_detected"] = False
-        out["face_inside_id"] = False
-        return out
-
-    # pick the largest face among those inside the ID
-    chosen_bbox, chosen_conf = max(faces_in_id, key=lambda t: _area(t[0]))
-    out["face_detected"] = True
-    out["largest_bbox"] = [float(v) for v in chosen_bbox]
-    out["face_inside_id"] = True
-
-    # 5) Size / proximity checks
-    id_w = float(id_bbox[2] - id_bbox[0])
-    face_w = float(chosen_bbox[2] - chosen_bbox[0])
-    id_fill_ratio = id_w / max(1.0, float(W))
-    out["id_fill_ratio"] = round(id_fill_ratio, 4)
-    out["id_fill_ok"] = bool(id_fill_ratio >= MIN_ID_W_RATIO)
-
-    out["face_w_px"] = int(round(face_w))
-    out["face_size_ok"] = bool(face_w >= MIN_FACE_W_PX)
-
-    if not (out["id_fill_ok"] and out["face_size_ok"]):
-        return out
-
-    # 6) Advisory: face ROI brightness + glare
-    f_status, f_mean = _face_brightness_status(image_bgr, chosen_bbox)
-    out["face_brightness_status"] = f_status
-    out["face_brightness_mean"] = float(f_mean)
-
-    roi_for_glare = _roi_from_bbox(image_bgr, chosen_bbox, 0.15, 0.15)
-    out["glare_detected"] = _glare_flags(roi_for_glare)
-
-    return out
-
 def run_id_extraction(input_path: str, output_path: str) -> None:
-    """
-    Detect face in the uploaded ID still and save a padded crop.
-    (Here we expect the upload to already be an ID ROI; we still pick the largest face.)
-    """
     out_path = Path(output_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -363,18 +504,26 @@ def run_id_extraction(input_path: str, output_path: str) -> None:
     if image is None:
         raise FileNotFoundError(f"ID image not found at path: {input_path}")
 
-    faces = _all_face_bboxes(image, FACE_CONF_THRESH)
-    if len(faces) == 0:
+    # detect faces on the full upload and choose the largest (letterbox mapping)
+    lb, r, pad = _letterbox_square(image, size=320, color=LB_COLOR)
+    det = FACE_MODEL.predict(source=[lb], imgsz=320, conf=FACE_CONF,
+                             device=DEVICE, verbose=False)[0]
+    if not det or det.boxes is None or len(det.boxes) == 0:
         raise Exception("❌ No face detected in ID image.")
 
-    # choose largest by area
-    bbox = max((bx for (bx, _c) in faces), key=_area)
-    x1_f, y1_f, x2_f, y2_f = map(int, bbox)
+    best = None; best_area = -1.0
+    for b in det.boxes:
+        x1, y1, x2, y2 = b.xyxy[0].tolist()
+        bx = _map_box_back((x1, y1, x2, y2), r, pad, image.shape[1], image.shape[0])
+        area = max(0.0, (bx[2]-bx[0])) * max(0.0, (bx[3]-bx[1]))
+        if area > best_area:
+            best_area = area; best = bx
 
+    x1_f, y1_f, x2_f, y2_f = map(int, best)
+    CROP_PAD_X, CROP_PAD_Y = 0.50, 0.50
     h, w = image.shape[:2]
     pad_x = int((x2_f - x1_f) * CROP_PAD_X)
     pad_y = int((y2_f - y1_f) * CROP_PAD_Y)
-
     x1 = max(x1_f - pad_x, 0)
     y1 = max(y1_f - pad_y, 0)
     x2 = min(x2_f + pad_x, w - 1)
@@ -386,6 +535,7 @@ def run_id_extraction(input_path: str, output_path: str) -> None:
 
 __all__ = [
     "analyze_id_frame",
+    "analyze_id_back_frame",
     "run_id_extraction",
     "enhance_id_image",
 ]
