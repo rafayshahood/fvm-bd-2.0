@@ -67,6 +67,9 @@ pip install onnxruntime-gpu face-recognition==1.3.0 albumentations==1.3.0 decord
 
 pip install torch==2.1.0+cu118 torchvision==0.16.0+cu118 torchaudio==2.1.0+cu118 \
   --index-url https://download.pytorch.org/whl/cu118
+
+pip install easyocr==1.7.1 rapidfuzz
+
 ```
 
 ---
@@ -90,6 +93,9 @@ From the main repo folder:
 ```bash
 cd Silent_Face_Anti_Spoofing/resources
 gdown --folder https://drive.google.com/drive/folders/13KYghJSu6M6gePEKfJUAxZAn9wGt9B0B
+
+cd ..
+cd ..
 ```
 
 ---
@@ -101,6 +107,9 @@ cd GenConViT/weight
 
 wget https://huggingface.co/Deressa/GenConViT/resolve/main/genconvit_ed_inference.pth
 wget https://huggingface.co/Deressa/GenConViT/resolve/main/genconvit_vae_inference.pth
+
+cd ..
+cd ..
 ```
 
 ---
@@ -109,7 +118,8 @@ wget https://huggingface.co/Deressa/GenConViT/resolve/main/genconvit_vae_inferen
 From the main repo folder:
 ```bash
  git clone https://github.com/TencentARC/GFPGAN.git
- gdown 1jHlpgqZxYsbHrreKcDgG_qKYX01EuqZw -O GFPGAN/experiments/pretrained_models/GFPGANv1.3.pth
+ cd GFPGAN
+ gdown 1jHlpgqZxYsbHrreKcDgG_qKYX01EuqZw -O experiments/pretrained_models/GFPGANv1.3.pth
 ```
 
 ---
