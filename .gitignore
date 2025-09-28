@@ -26,7 +26,8 @@ selected_faces/
 temp/
 video_faces/
 test_cases_fvm/
-
+GFPGAN
+id-card-detector/
 # Ignore system files
 .DS_Storerecordings/
 recordings/
