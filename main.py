@@ -22,7 +22,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from id import analyze_id_frame, run_id_extraction
+from id import analyze_id_frame, run_id_extraction, analyze_id_back_frame
 from new_verif import run_verif  # noqa: F401
 from all_video import (
     run_full_frame_pipeline,   # noqa: F401
@@ -374,10 +374,13 @@ async def req_state(req_id: str, request: Request):
 
 
 # ------------------------------------------------------------------------------
-# LIVE ID WebSocket (front side — full guidance)
+# LIVE ID WebSocket (front side — NEW conditions only)
 # ------------------------------------------------------------------------------
 # ------------------------------------------------------------------------------
-# LIVE ID WebSocket (front side — full guidance with debouncing)
+# LIVE ID WebSocket — EXACT new-script conditions + full metrics + frame size
+# ------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
+# LIVE ID WebSocket — EXACT new-script conditions + full metrics + frame size
 # ------------------------------------------------------------------------------
 @app.websocket("/ws-id-live")
 async def websocket_id_live(ws: WebSocket):
@@ -387,19 +390,15 @@ async def websocket_id_live(ws: WebSocket):
     base = Path("temp") / req_id
     (base / "id").mkdir(parents=True, exist_ok=True)
 
-    # processed fps ~5 (every 5th frame). Choose N=3 by default ≈ 0.6s to flip.
     STREAK_N = int(os.getenv("ID_STREAK_N", "3"))
+    OCR_STREAK_N = max(1, STREAK_N // 2)  # ← halve OCR stability requirement
 
-    # debouncers for all booleans that drive UX
     streaks = {
-        "brightness_ok":     BoolStreak(STREAK_N),
-        "id_card_detected":  BoolStreak(STREAK_N),
-        "id_inside_rect":    BoolStreak(STREAK_N),
-        "face_detected":     BoolStreak(STREAK_N),
-        "id_fill_ok":        BoolStreak(STREAK_N),
-        "face_size_ok":      BoolStreak(STREAK_N),
-        "face_bright_ok":    BoolStreak(STREAK_N),   # derived from face_brightness_status
-        "glare_detected":    BoolStreak(STREAK_N),
+        "id_card_detected": BoolStreak(STREAK_N),
+        "id_overlap_ok":    BoolStreak(STREAK_N),
+        "id_size_ok":       BoolStreak(STREAK_N),
+        "face_on_id":       BoolStreak(STREAK_N),
+        "ocr_ok":           BoolStreak(OCR_STREAK_N),  # ← use halved value here
     }
 
     frame_idx = 0
@@ -416,80 +415,69 @@ async def websocket_id_live(ws: WebSocket):
             except Exception:
                 continue
 
+            H, W = frame.shape[:2]
             frame_idx += 1
-            # process every 5th frame (≈5 fps)
+
+            # throttle: send every 5th frame if we already sent one recently
             if frame_idx % 5 != 0 and last_payload is not None:
                 payload = dict(last_payload)
                 payload["skipped"] = True
+                payload["frame_w"] = int(W)
+                payload["frame_h"] = int(H)
                 await ws.send_json(_to_jsonable(payload))
                 continue
 
             rep = analyze_id_frame(frame)
 
-            # derive raw booleans
-            raw_brightness_ok = (rep.get("brightness_status") == "ok")
-            raw_face_bright_ok = (
-                rep.get("face_brightness_status") in (None, "ok")
-            )
+            # Debounce gates (like the demo's "stable" counter)
+            id_card_ok = streaks["id_card_detected"].update(rep.get("id_card_detected"))
+            overlap_ok = streaks["id_overlap_ok"].update(rep.get("id_overlap_ok"))
+            size_ok    = streaks["id_size_ok"].update(rep.get("id_size_ok"))
+            face_ok    = streaks["face_on_id"].update(rep.get("face_on_id"))
+            ocr_ok     = streaks["ocr_ok"].update(rep.get("ocr_ok"))
 
-            # feed debouncers
-            brightness_ok   = streaks["brightness_ok"].update(raw_brightness_ok)
-            id_card_ok      = streaks["id_card_detected"].update(rep.get("id_card_detected"))
-            inside_rect_ok  = streaks["id_inside_rect"].update(rep.get("id_inside_rect"))
-            face_ok         = streaks["face_detected"].update(bool(rep.get("face_detected")))
-            id_fill_ok      = streaks["id_fill_ok"].update(rep.get("id_fill_ok"))
-            face_size_ok    = streaks["face_size_ok"].update(rep.get("face_size_ok"))
-            face_bright_ok  = streaks["face_bright_ok"].update(raw_face_bright_ok)
-            glare_detected  = streaks["glare_detected"].update(rep.get("glare_detected"))
-
-            # build payload; keep exact same field names but with debounced values.
             payload = {
                 "req_id": req_id,
 
-                # keep raw values for debugging (prefixed)
-                "raw": {
-                    "brightness_status": rep.get("brightness_status"),
-                    "face_brightness_status": rep.get("face_brightness_status"),
-                    "id_card_detected": rep.get("id_card_detected"),
-                    "id_inside_rect": rep.get("id_inside_rect"),
-                    "face_detected": bool(rep.get("face_detected")),
-                    "id_fill_ok": rep.get("id_fill_ok"),
-                    "face_size_ok": rep.get("face_size_ok"),
-                    "glare_detected": rep.get("glare_detected"),
-                },
+                # Frame size (so FE can map boxes 1:1 even if we downscale)
+                "frame_w": int(W),
+                "frame_h": int(H),
 
-                # debounced values surfaced under original keys (UX-friendly)
-                "brightness_status": ("ok" if brightness_ok else rep.get("brightness_status") or "too_dark"),
+                # Geometry for FE overlay (rect is in frame coords)
+                "rect": rep.get("rect"),
+                "roi_xyxy": rep.get("roi_xyxy"),
+
+                # Brightness — first gate
+                "brightness_ok": rep.get("brightness_ok"),
+                "brightness_status": rep.get("brightness_status"),
                 "brightness_mean": rep.get("brightness_mean"),
 
+                # Detections
                 "id_card_detected": bool(id_card_ok),
                 "id_card_bbox": rep.get("id_card_bbox"),
                 "id_card_conf": rep.get("id_card_conf"),
 
-                "rect": rep.get("rect"),
-                "id_inside_rect": bool(inside_rect_ok),
+                # Gates (debounced booleans) + raw metrics (not debounced)
+                "id_overlap_ok": bool(overlap_ok),
+                "id_frac_in": rep.get("id_frac_in"),
+                "id_size_ok": bool(size_ok),
+                "id_size_ratio": rep.get("id_size_ratio"),
+                "id_ar": rep.get("id_ar"),
 
-                "face_detected": bool(face_ok),
+                # Face-on-ID
+                "face_on_id": bool(face_ok),
                 "largest_bbox": rep.get("largest_bbox"),
-                "face_inside_id": rep.get("face_inside_id"),
 
-                "id_fill_ratio": rep.get("id_fill_ratio"),
-                "id_fill_ok": bool(id_fill_ok),
+                # OCR metrics (always computed once size+overlap+ar ok)
+                "ocr_ok": bool(ocr_ok),
+                "ocr_inside_ratio": rep.get("ocr_inside_ratio"),
+                "ocr_hits": rep.get("ocr_hits"),
+                "ocr_mean_conf": rep.get("ocr_mean_conf"),
 
-                "face_w_px": rep.get("face_w_px"),
-                "face_size_ok": bool(face_size_ok),
+                # Combined verdict (not debounced)
+                "verified": bool(rep.get("verified")),
 
-                # show "ok"/None only if debounced ok; else pass through raw status (dark/bright)
-                "face_brightness_status": ("ok" if face_bright_ok else rep.get("face_brightness_status")),
-                "face_brightness_mean": rep.get("face_brightness_mean"),
-
-                "glare_detected": bool(glare_detected),
-
-                # extras
-                "roi_xyxy": rep.get("roi_xyxy"),
-                "roi_w": rep.get("roi_w"),
-                "roi_h": rep.get("roi_h"),
-
+                # housekeeping
                 "skipped": False,
                 "saved": False,
             }
@@ -499,8 +487,73 @@ async def websocket_id_live(ws: WebSocket):
     except WebSocketDisconnect:
         print(f"🔌 ID live verification ended for {req_id}")
 
+        
+
 # ------------------------------------------------------------------------------
-# LIVE ID BACK WebSocket (brightness + ID detection only)
+# ID still upload (FRONT) — saves still and crops face for verification
+# ------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
+# ID still upload (FRONT) — expects FULL FRAME; enhance → crop; keep only needed files
+# ------------------------------------------------------------------------------
+@app.post("/upload-id-still")
+async def upload_id_still(request: Request, image: UploadFile = File(...)):
+    """
+    Accepts ONE file 'image' which must be the FULL camera frame.
+    Saves to id_frame_raw.jpg, enhances to id_frame_enhanced.jpg,
+    crops the ID portrait face; deletes raw if enhancement succeeds.
+    Returns direct URLs without relying on legacy filenames.
+    """
+    req_id = _req_id_from(request)
+    paths = _base_paths(req_id)
+    base, id_dir = paths["base"], paths["id_dir"]
+    base.mkdir(parents=True, exist_ok=True)
+    id_dir.mkdir(parents=True, exist_ok=True)
+
+    # Save full frame (raw)
+    id_raw_full = id_dir / "id_frame_raw.jpg"
+    id_raw_full.write_bytes(await image.read())
+
+    # Enhance (best effort)
+    used_for_cropping = id_raw_full
+    enhanced_ok = False
+    id_enhanced_full = id_dir / "id_frame_enhanced.jpg"
+    try:
+        from id import enhance_id_image
+        if enhance_id_image(str(id_raw_full), str(id_enhanced_full)):
+            used_for_cropping = id_enhanced_full
+            enhanced_ok = True
+    except Exception as e:
+        print(f"⚠️ Enhancement failed ({e}). Using raw full frame for face crop.")
+
+    # Face crop from the chosen full frame
+    cropped = id_dir / "cropped_id_face.jpg"
+    try:
+        run_id_extraction(str(used_for_cropping), str(cropped))
+    except Exception as e:
+        return JSONResponse({"ok": False, "req_id": req_id, "error": str(e)}, status_code=400)
+
+    # Optional: remove raw if enhanced succeeded (reduce footprint)
+    if enhanced_ok:
+        try:
+            id_raw_full.unlink()
+        except Exception:
+            pass
+
+    # Build URLs explicitly (avoid legacy helpers)
+    id_image_name = "id_frame_enhanced.jpg" if enhanced_ok else "id_frame_raw.jpg"
+    id_image_url = _abs_url(request, f"/temp/{req_id}/id/{id_image_name}")
+    cropped_url = _abs_url(request, f"/temp/{req_id}/id/cropped_id_face.jpg")
+
+    return JSONResponse({
+        "ok": True,
+        "req_id": req_id,
+        "used_id_path": id_image_url,
+        "cropped_face": cropped_url,
+        "state": _state_for_req(req_id),
+    })
+
+# ------------------------------------------------------------------------------
+# LIVE ID BACK WebSocket — same as front but WITHOUT face checks
 # ------------------------------------------------------------------------------
 @app.websocket("/ws-id-back-live")
 async def websocket_id_back_live(ws: WebSocket):
@@ -509,6 +562,17 @@ async def websocket_id_back_live(ws: WebSocket):
     req_id = (qs.get("req_id", [None])[0]) or (qs.get("sid", [None])[0]) or uuid4().hex
     base = Path("temp") / req_id
     (base / "id_back").mkdir(parents=True, exist_ok=True)
+
+    STREAK_N = int(os.getenv("ID_BACK_STREAK_N", os.getenv("ID_STREAK_N", "3")))
+    OCR_STREAK_N = max(1, STREAK_N // 2)
+
+    streaks = {
+        "id_card_detected": BoolStreak(STREAK_N),
+        "id_overlap_ok":    BoolStreak(STREAK_N),
+        "id_size_ok":       BoolStreak(STREAK_N),
+        "ocr_ok":           BoolStreak(OCR_STREAK_N),
+    }
+
     frame_idx = 0
     last_payload: Optional[dict] = None
     try:
@@ -523,71 +587,86 @@ async def websocket_id_back_live(ws: WebSocket):
             except Exception:
                 continue
 
+            H, W = frame.shape[:2]
             frame_idx += 1
-            if frame_idx % 2 != 0 and last_payload is not None:
+
+            # throttle (mirror front behavior)
+            if frame_idx % 5 != 0 and last_payload is not None:
                 payload = dict(last_payload)
                 payload["skipped"] = True
+                payload["frame_w"] = int(W)
+                payload["frame_h"] = int(H)
                 await ws.send_json(_to_jsonable(payload))
                 continue
 
-            rep = analyze_id_frame(frame)  # we’ll only forward the minimal fields
+            # ⬇️ analyze BACK side (no face checks inside)
+            rep = analyze_id_back_frame(frame)
+
+            # Debounce relevant gates
+            id_card_ok = streaks["id_card_detected"].update(rep.get("id_card_detected"))
+            overlap_ok = streaks["id_overlap_ok"].update(rep.get("id_overlap_ok"))
+            size_ok    = streaks["id_size_ok"].update(rep.get("id_size_ok"))
+            ocr_ok     = streaks["ocr_ok"].update(rep.get("ocr_ok"))
+
             payload = {
                 "req_id": req_id,
+
+                # Frame size for overlay mapping
+                "frame_w": int(W),
+                "frame_h": int(H),
+
+                # Guide geometry (pixel coords)
+                "rect": rep.get("rect"),
+                "roi_xyxy": rep.get("roi_xyxy"),
+
+                # Brightness first
+                "brightness_ok": rep.get("brightness_ok"),
                 "brightness_status": rep.get("brightness_status"),
                 "brightness_mean": rep.get("brightness_mean"),
-                "id_card_detected": rep.get("id_card_detected"),
+
+                # Detections
+                "id_card_detected": bool(id_card_ok),
                 "id_card_bbox": rep.get("id_card_bbox"),
                 "id_card_conf": rep.get("id_card_conf"),
+
+                # Gates (+ raw metrics)
+                "id_overlap_ok": bool(overlap_ok),
+                "id_frac_in": rep.get("id_frac_in"),
+                "id_size_ok": bool(size_ok),
+                "id_size_ratio": rep.get("id_size_ratio"),
+                "id_ar": rep.get("id_ar"),
+
+                # OCR metrics
+                "ocr_ok": bool(ocr_ok),
+                "ocr_inside_ratio": rep.get("ocr_inside_ratio"),
+                "ocr_hits": rep.get("ocr_hits"),
+                "ocr_mean_conf": rep.get("ocr_mean_conf"),
+
+                # Combined verdict for BACK (no face gate)
+                "verified": bool(rep.get("verified")),
+
+                # housekeeping
                 "skipped": False,
             }
+
             last_payload = payload
             await ws.send_json(_to_jsonable(payload))
     except WebSocketDisconnect:
         print(f"🔌 ID BACK live verification ended for {req_id}")
 
-# ------------------------------------------------------------------------------
-# ID still upload (FRONT) — saves still and crops face for verification
-# ------------------------------------------------------------------------------
-@app.post("/upload-id-still")
-async def upload_id_still(request: Request, image: UploadFile = File(...)):
-    req_id = _req_id_from(request)
-    paths = _base_paths(req_id)
-    base, id_dir = paths["base"], paths["id_dir"]
-    base.mkdir(parents=True, exist_ok=True)
-    id_dir.mkdir(parents=True, exist_ok=True)
 
-    id_raw = id_dir / "id_raw_upload.jpg"
-    id_raw.write_bytes(await image.read())
 
-    used_for_cropping = id_raw
-    try:
-        from id import enhance_id_image
-        id_enhanced = id_dir / "id_enhanced.jpg"
-        if enhance_id_image(str(id_raw), str(id_enhanced)):
-            used_for_cropping = id_enhanced
-    except Exception as e:
-        print(f"⚠️ Enhancement failed ({e}). Using raw ROI upload.")
-
-    cropped = id_dir / "cropped_id_face.jpg"
-    try:
-        run_id_extraction(str(used_for_cropping), str(cropped))
-    except Exception as e:
-        return JSONResponse({"ok": False, "req_id": req_id, "error": str(e)}, status_code=400)
-
-    urls = _result_urls_for_req(req_id, request)
-    return JSONResponse({
-        "ok": True,
-        "req_id": req_id,
-        "used_id_path": urls["id_image_url"],
-        "cropped_face": urls["cropped_face_url"],
-        "state": _state_for_req(req_id),
-    })
 
 # ------------------------------------------------------------------------------
-# ID BACK still upload — saves back image only (no face crop)
+# ID BACK still upload — save RAW only (no enhancement, no crop)
 # ------------------------------------------------------------------------------
 @app.post("/upload-id-back-still")
 async def upload_id_back_still(request: Request, image: UploadFile = File(...)):
+    """
+    Accepts ONE file 'image' for the BACK side (FULL frame).
+    Saves RAW only to /temp/<req_id>/id_back/id_back_raw_upload.jpg
+    and returns its absolute URL. No enhancement, no cropping.
+    """
     req_id = _req_id_from(request)
     paths = _base_paths(req_id)
     base, id_back_dir = paths["base"], paths["id_back_dir"]
@@ -597,23 +676,13 @@ async def upload_id_back_still(request: Request, image: UploadFile = File(...)):
     raw_path = id_back_dir / "id_back_raw_upload.jpg"
     raw_path.write_bytes(await image.read())
 
-    # Optional enhancement (best-effort; ignore errors)
-    enhanced_path = id_back_dir / "id_back_enhanced.jpg"
-    try:
-        from id import enhance_id_image
-        if enhance_id_image(str(raw_path), str(enhanced_path)):
-            pass
-    except Exception as e:
-        print(f"⚠️ Back-side enhancement failed ({e}). Using raw image.")
-
-    urls = _result_urls_for_req(req_id, request)
+    url = _abs_url(request, f"/temp/{req_id}/id_back/{raw_path.name}")
     return JSONResponse({
         "ok": True,
         "req_id": req_id,
-        "used_id_back_path": urls["id_back_image_url"],
+        "used_id_back_path": url,
         "state": _state_for_req(req_id),
     })
-
 # ------------------------------------------------------------------------------
 # LIVE FACE (video) WebSocket
 # ------------------------------------------------------------------------------
@@ -685,18 +754,24 @@ async def upload_live_clip(request: Request, video: UploadFile = File(...)):
         mp4_path = convert_to_mp4(raw_path, rec_dir)
         canonical = base / "video.mp4"
         shutil.copyfile(mp4_path, canonical)
+        
+        # Clean up recordings folder after canonical video is created
+        try:
+            shutil.rmtree(rec_dir, ignore_errors=True)
+            print(f"✅ Cleaned up recordings folder for {req_id}")
+        except Exception as e:
+            print(f"⚠️ Failed to clean recordings folder: {e}")
+            
     except Exception as e:
         return JSONResponse({"ok": False, "req_id": req_id, "error": str(e)}, status_code=400)
 
     # start deepfake detection in background
-    _ensure_deepfake_async(mp4_path, base)
+    _ensure_deepfake_async(canonical, base)  # Use canonical instead of mp4_path
 
     urls = _result_urls_for_req(req_id, request)
     return JSONResponse({
         "ok": True,
         "req_id": req_id,
-        "saved_raw": str(raw_path),
-        "saved_mp4": str(mp4_path),
         "canonical_mp4": urls["video_url"],
         "deepfake": _deepfake_state_for_req(base),
         "state": _state_for_req(req_id),
