@@ -1,6 +1,6 @@
 # id.py — shared analyzers for front and back sides of ID
-# Front: same as before (brightness → ID-in-ROI → overlap/size/area/ar → FACE-on-ID → OCR)
-# Back:  brightness → ID-in-ROI → overlap/size/area/ar → OCR (NO face gate; different OCR keywords)
+# Front: brightness → ID-in-ROI → overlap/size/area/ar → FACE-on-ID → OCR
+# Back:  brightness → ID-in-ROI → overlap/size/area/ar → QR CODE (no OCR, no face)
 
 from __future__ import annotations
 from pathlib import Path
@@ -52,10 +52,10 @@ OVERLAP_MIN: float           = float(os.getenv("ID_OVERLAP_MIN", "0.60"))
 OCR_BOX_KEEP_PCT: float      = float(os.getenv("ID_OCR_KEEP_PCT", "0.90"))
 MIN_GUIDE_COVER_FRAC: float  = float(os.getenv("ID_MIN_GUIDE_COVER", "0.30"))
 
-# OCR thresholds (relaxed for international compatibility)
-OCR_REQUIRED_HITS: int  = int(os.getenv("ID_OCR_HITS", "1"))      # Reduced from 2
-OCR_MIN_CONF: float     = float(os.getenv("ID_OCR_MIN_CONF", "0.45"))  # Reduced from 0.55
-FUZZY: int              = int(os.getenv("ID_OCR_FUZZY", "70"))     # Reduced from 75
+# OCR thresholds (for FRONT only now)
+OCR_REQUIRED_HITS: int  = int(os.getenv("ID_OCR_HITS", "1"))
+OCR_MIN_CONF: float     = float(os.getenv("ID_OCR_MIN_CONF", "0.45"))
+FUZZY: int              = int(os.getenv("ID_OCR_FUZZY", "70"))
 
 # Brightness thresholds
 BRIGHT_MIN: int = int(os.getenv("ID_BRIGHT_MIN", "60"))
@@ -68,100 +68,26 @@ LB_COLOR = (114,114,114)
 RECT_W_RATIO: float = 0.95
 RECT_H_RATIO: float = 0.45
 
-# EasyOCR with multi-language support - dual reader approach for language constraints
+# EasyOCR with multi-language support (FRONT only)
 _EASYOCR_USE_GPU = bool(torch.cuda.is_available())
-reader_primary = easyocr.Reader(['en','es'], gpu=_EASYOCR_USE_GPU)  # English + Spanish
-reader_urdu = easyocr.Reader(['en','ur'], gpu=_EASYOCR_USE_GPU)     # English + Urdu
+reader_primary = easyocr.Reader(['en','es'], gpu=_EASYOCR_USE_GPU)
+reader_urdu = easyocr.Reader(['en','ur'], gpu=_EASYOCR_USE_GPU)
 
 # -----------------------------------------------------------------------------
-# OCR keyword/regex sets (FRONT & BACK)
+# OCR keyword/regex sets (FRONT ONLY)
 # -----------------------------------------------------------------------------
 KW_FRONT = [
-    # Spanish + English generic front-of-ID terms
     "identidad","identificación","cédula","ciudadanía","república","colombia","nacional",
     "autoridad","expedición","vencimiento","sexo","nombre","apellidos","nuip",
     "identity","identification","id card","national","authority","republic","government","passport"
 ]
 RGX_FRONT = [
-    r"\b\d{6,}\b",  # long numerics
-    r"\b(19|20)\d{2}[./\- ]\d{1,2}[./\- ]\d{1,2}\b",  # YYYY-MM-DD variants
+    r"\b\d{6,}\b",
+    r"\b(19|20)\d{2}[./\- ]\d{1,2}[./\- ]\d{1,2}\b",
     r"\b\d{1,2}\s*(ene|feb|mar|abr|may|jun|jul|ago|sep|oct|nov|dic|"
     r"jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\s*(19|20)\d{2}\b",
     r"\b(NUIP|N\.U\.I\.P\.?)\b",
     r"\b\d{1,3}\.\d{3}\.\d{3}\.\d{1,4}\b"
-]
-
-# Enhanced back-side keywords (Pakistani + Colombian + International)
-KW_BACK = [
-    # Pakistani CNIC terms (English & transliterated Urdu)
-    "cnic", "computerized", "national", "identity", "card", "pakistan", "pakistani",
-    "nadra", "authority", "registration", "database", "islamic", "republic",
-    "date of birth", "date of issue", "date of expiry", "signature", "holder",
-    "father", "husband", "address", "district", "province", "tehsil",
-    
-    # Colombian Cedula terms (Spanish)
-    "registraduría", "registraduria", "nacional del estado civil", "república", "colombia",
-    "expedición", "lugar de expedición", "fecha de expedición", "vigencia",
-    "firma", "huella", "grupo sanguíneo", "rh", "observaciones",
-    
-    # Generic international ID terms (English/Spanish)
-    "documento", "document", "autoridad", "authority", "número", "number", "serial",
-    "barcode", "qr", "code", "identification", "citizen", "residency", "passport",
-    "government", "official", "valid", "expires", "issued", "birth", "sex", "gender",
-    "male", "female", "masculino", "femenino", "hombre", "mujer",
-    
-    # Address-related terms (multiple languages)
-    "address", "dirección", "domicilio", "residence", "location", "city", "ciudad",
-    "state", "estado", "country", "país", "postal", "zip", "code",
-    
-    # Common ID elements
-    "photo", "picture", "imagen", "photograph", "security", "seguridad",
-    "features", "características", "watermark", "hologram", "chip",
-    
-    # Blood type variations
-    "blood", "sangre", "tipo", "type", "group", "grupo", "rh+", "rh-", "o+", "o-", "a+", "a-", "b+", "b-", "ab+", "ab-",
-]
-
-# Enhanced regex patterns for international coverage
-RGX_BACK = [
-    # Long numeric sequences (ID numbers, CNIC numbers)
-    r"\b\d{6,}\b",
-    r"\b\d{5}-\d{7}-\d{1}\b",  # Pakistani CNIC format (12345-1234567-1)
-    r"\b\d{2,3}\.\d{3}\.\d{3}[-.]?\d{1,4}\b",  # Colombian format variations
-    
-    # Date patterns (multiple formats)
-    r"\b(19|20)\d{2}[./\-]\d{1,2}[./\-]\d{1,2}\b",  # YYYY-MM-DD variants
-    r"\b\d{1,2}[./\-]\d{1,2}[./\-](19|20)\d{2}\b",  # DD-MM-YYYY variants
-    r"\b\d{1,2}[./\-](19|20)\d{2}\b",  # MM-YYYY variants
-    
-    # Month name patterns (English/Spanish)
-    r"\b\d{1,2}\s*(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|"
-    r"ene|feb|mar|abr|may|jun|jul|ago|sep|oct|nov|dic)\s*(19|20)\d{2}\b",
-    
-    # Pakistani specific patterns
-    r"\b(CNIC|C\.N\.I\.C\.?)\b",
-    r"\b(NADRA|N\.A\.D\.R\.A\.?)\b",
-    r"\b(S/O|D/O|W/O)\b",  # Son/Daughter/Wife of
-    r"\b\d{5}-\d{7}-\d\b",  # CNIC number format
-    
-    # Colombian specific patterns  
-    r"\b(NUIP|N\.U\.I\.P\.?)\b",
-    r"\b(RH|grupo sanguíneo|grupo sanguineo)\b",
-    r"\bserial\s*[#: ]?\s*\w+\b",
-    r"\bregistraduría\s+nacional\b",
-    
-    # Blood type patterns
-    r"\b(A|B|AB|O)[+-]?\b",
-    r"\b(RH|Rh)[+-]?\b",
-    
-    # Generic ID patterns
-    r"\b(ID|I\.D\.?)\s*[:.]?\s*\w+\b",
-    r"\b(No|Num|Number|Número)[:.]?\s*\d+\b",
-    r"\b(Exp|Expires|Expiry|Expiration|Vence|Vigencia)[:.]?\s*\d{1,2}[./\-]\d{1,2}[./\-]\d{2,4}\b",
-    
-    # Security feature patterns
-    r"\b(Security|Seguridad)\s+(Features|Características)\b",
-    r"\b(Watermark|Hologram|Chip)\b",
 ]
 
 # -----------------------------------------------------------------------------
@@ -169,7 +95,7 @@ RGX_BACK = [
 # -----------------------------------------------------------------------------
 def _center_rect_for_image(w: int, h: int, w_ratio: float = RECT_W_RATIO, h_ratio: float = RECT_H_RATIO):
     rw = w * float(w_ratio); rh = h * float(h_ratio)
-    return (w - rw) / 2.0, (h - rh) / 2.0, rw, rh  # x,y,w,h (float)
+    return (w - rw) / 2.0, (h - rh) / 2.0, rw, rh
 
 def _letterbox_square(img: np.ndarray, size: int = 640, color=(114,114,114)):
     h, w = img.shape[:2]
@@ -266,10 +192,8 @@ def _ocr_verify_crop_inside_custom(
     crop_bgr: np.ndarray, ix1: int, iy1: int, guide_xyxy, kw_list: List[str], rgx_list: List[str],
     required_hits: int = OCR_REQUIRED_HITS, min_conf: float = OCR_MIN_CONF, fuzzy: int = FUZZY
 ):
-    # Try primary reader (English + Spanish) first
     res = reader_primary.readtext(crop_bgr, detail=1, paragraph=False)
     if not res:
-        # Fallback to Urdu reader for Arabic-script text
         try:
             res = reader_urdu.readtext(crop_bgr, detail=1, paragraph=False)
         except Exception:
@@ -305,6 +229,16 @@ def _ocr_verify_crop_inside_custom(
     ok = (hits >= required_hits) and (mean_conf >= min_conf)
     return ok, mean_conf, hits, joined, inside_ratio
 
+def _detect_qr_code(image_bgr: np.ndarray) -> bool:
+    """Detect if image contains a QR code using OpenCV."""
+    try:
+        detector = cv2.QRCodeDetector()
+        data, bbox, _ = detector.detectAndDecode(image_bgr)
+        return bbox is not None and len(bbox) > 0
+    except Exception as e:
+        print(f"⚠️ QR detection error: {e}")
+        return False
+
 # -----------------------------------------------------------------------------
 # Public analyzers
 # -----------------------------------------------------------------------------
@@ -327,14 +261,12 @@ def analyze_id_frame(
         "verified": False,
     }
 
-    # Guide
     rx, ry, rw, rh = _center_rect_for_image(W, H, rect_w_ratio, rect_h_ratio)
     gx1, gy1 = int(rx), int(ry); gx2, gy2 = int(rx + rw), int(ry + rh)
     guide_xyxy = (gx1, gy1, gx2, gy2)
     out["rect"] = [float(rx), float(ry), float(rw), float(rh)]
     out["roi_xyxy"] = [gx1, gy1, gx2, gy2]
 
-    # (0) Brightness
     b_ok, b_mean, b_status = _brightness_eval(image_bgr)
     out["brightness_ok"] = bool(b_ok)
     out["brightness_mean"] = float(b_mean)
@@ -342,7 +274,6 @@ def analyze_id_frame(
     if not b_ok:
         return out
 
-    # (1) Detect ID in ROI
     id_ok, id_bbox, id_conf = _detect_id_card_in_roi(image_bgr, guide_xyxy)
     out["id_card_detected"] = bool(id_ok)
     out["id_card_bbox"] = list(id_bbox) if id_bbox else None
@@ -350,7 +281,6 @@ def analyze_id_frame(
     if not id_ok:
         return out
 
-    # Geometry + gates
     x1, y1, x2, y2 = id_bbox
     ar_ok, ar = _aspect_ok(x2 - x1, y2 - y1); out["id_ar"] = float(ar)
     inter, frac_in, inter_area = _rect_intersect(id_bbox, guide_xyxy); out["id_frac_in"] = float(frac_in)
@@ -363,18 +293,15 @@ def analyze_id_frame(
     if not _area_frac_ok(x1, y1, x2, y2, W, H): return out
     if not ar_ok: return out
 
-    # Crop for face+OCR
     ix1, iy1, ix2, iy2 = map(int, inter)
     id_crop = image_bgr[iy1:iy2, ix1:ix2]
 
-    # Face-on-ID
     f_ok, f_box = _detect_face_in_id_crop(id_crop, imgsz=320)
     out["face_on_id"] = bool(f_ok)
     if f_ok and f_box is not None:
         fx1, fy1, fx2, fy2 = f_box
         out["largest_bbox"] = [ix1 + fx1, iy1 + fy1, ix1 + fx2, iy1 + fy2]
 
-    # OCR (front)
     ocr_ok, mean_conf, hits, _joined, inside_ratio = _ocr_verify_crop_inside_custom(
         id_crop, ix1, iy1, guide_xyxy, KW_FRONT, RGX_FRONT, OCR_REQUIRED_HITS, OCR_MIN_CONF, FUZZY
     )
@@ -383,7 +310,6 @@ def analyze_id_frame(
     out["ocr_hits"] = int(hits)
     out["ocr_mean_conf"] = float(mean_conf)
 
-    # Final verdict (front): overlap + size + face + OCR
     out["verified"] = bool(out["id_overlap_ok"] and out["id_size_ok"] and out["face_on_id"] and out["ocr_ok"])
     return out
 
@@ -393,7 +319,7 @@ def analyze_id_back_frame(
     rect_w_ratio: float = RECT_W_RATIO,
     rect_h_ratio: float = RECT_H_RATIO,
 ) -> Dict[str, Optional[object]]:
-    """BACK side analyzer: same gates, NO face gate, OCR uses KW_BACK/RGX_BACK."""
+    """BACK side analyzer: brightness → ID detection → overlap/size → QR CODE only."""
     H, W = image_bgr.shape[:2]
     out: Dict[str, Optional[object]] = {
         "rect": None, "roi_xyxy": None,
@@ -402,19 +328,16 @@ def analyze_id_back_frame(
         "id_frac_in": None, "id_overlap_ok": None,
         "id_size_ratio": None, "id_size_ok": None,
         "id_ar": None,
-        # No face outputs for back
-        "ocr_ok": None, "ocr_inside_ratio": None, "ocr_hits": None, "ocr_mean_conf": None,
+        "qr_detected": None,
         "verified": False,
     }
 
-    # Guide
     rx, ry, rw, rh = _center_rect_for_image(W, H, rect_w_ratio, rect_h_ratio)
     gx1, gy1 = int(rx), int(ry); gx2, gy2 = int(rx + rw), int(ry + rh)
     guide_xyxy = (gx1, gy1, gx2, gy2)
     out["rect"] = [float(rx), float(ry), float(rw), float(rh)]
     out["roi_xyxy"] = [gx1, gy1, gx2, gy2]
 
-    # (0) Brightness
     b_ok, b_mean, b_status = _brightness_eval(image_bgr)
     out["brightness_ok"] = bool(b_ok)
     out["brightness_mean"] = float(b_mean)
@@ -422,7 +345,6 @@ def analyze_id_back_frame(
     if not b_ok:
         return out
 
-    # (1) Detect ID in ROI
     id_ok, id_bbox, id_conf = _detect_id_card_in_roi(image_bgr, guide_xyxy)
     out["id_card_detected"] = bool(id_ok)
     out["id_card_bbox"] = list(id_bbox) if id_bbox else None
@@ -430,7 +352,6 @@ def analyze_id_back_frame(
     if not id_ok:
         return out
 
-    # Geometry + gates
     x1, y1, x2, y2 = id_bbox
     ar_ok, ar = _aspect_ok(x2 - x1, y2 - y1); out["id_ar"] = float(ar)
     inter, frac_in, inter_area = _rect_intersect(id_bbox, guide_xyxy); out["id_frac_in"] = float(frac_in)
@@ -443,21 +364,13 @@ def analyze_id_back_frame(
     if not _area_frac_ok(x1, y1, x2, y2, W, H): return out
     if not ar_ok: return out
 
-    # Crop for OCR
     ix1, iy1, ix2, iy2 = map(int, inter)
     id_crop = image_bgr[iy1:iy2, ix1:ix2]
 
-    # OCR (back)
-    ocr_ok, mean_conf, hits, _joined, inside_ratio = _ocr_verify_crop_inside_custom(
-        id_crop, ix1, iy1, guide_xyxy, KW_BACK, RGX_BACK, OCR_REQUIRED_HITS, OCR_MIN_CONF, FUZZY
-    )
-    out["ocr_ok"] = bool(ocr_ok)
-    out["ocr_inside_ratio"] = float(inside_ratio)
-    out["ocr_hits"] = int(hits)
-    out["ocr_mean_conf"] = float(mean_conf)
+    qr_found = _detect_qr_code(id_crop)
+    out["qr_detected"] = bool(qr_found)
 
-    # Final verdict (back): overlap + size + OCR (no face gate)
-    out["verified"] = bool(out["id_overlap_ok"] and out["id_size_ok"] and out["ocr_ok"])
+    out["verified"] = bool(out["id_overlap_ok"] and out["id_size_ok"] and out["qr_detected"])
     return out
 
 # -----------------------------------------------------------------------------
@@ -504,7 +417,6 @@ def run_id_extraction(input_path: str, output_path: str) -> None:
     if image is None:
         raise FileNotFoundError(f"ID image not found at path: {input_path}")
 
-    # detect faces on the full upload and choose the largest (letterbox mapping)
     lb, r, pad = _letterbox_square(image, size=320, color=LB_COLOR)
     det = FACE_MODEL.predict(source=[lb], imgsz=320, conf=FACE_CONF,
                              device=DEVICE, verbose=False)[0]
