@@ -610,42 +610,22 @@ async def websocket_id_back_live(ws: WebSocket):
 
             payload = {
                 "req_id": req_id,
-
-                # Frame size for overlay mapping
                 "frame_w": int(W),
                 "frame_h": int(H),
-
-                # Guide geometry (pixel coords)
                 "rect": rep.get("rect"),
                 "roi_xyxy": rep.get("roi_xyxy"),
-
-                # Brightness first
                 "brightness_ok": rep.get("brightness_ok"),
                 "brightness_status": rep.get("brightness_status"),
                 "brightness_mean": rep.get("brightness_mean"),
-
-                # Detections
                 "id_card_detected": bool(id_card_ok),
                 "id_card_bbox": rep.get("id_card_bbox"),
                 "id_card_conf": rep.get("id_card_conf"),
-
-                # Gates (+ raw metrics)
                 "id_overlap_ok": bool(overlap_ok),
                 "id_frac_in": rep.get("id_frac_in"),
                 "id_size_ok": bool(size_ok),
                 "id_size_ratio": rep.get("id_size_ratio"),
-                "id_ar": rep.get("id_ar"),
-
-                # OCR metrics
-                "ocr_ok": bool(ocr_ok),
-                "ocr_inside_ratio": rep.get("ocr_inside_ratio"),
-                "ocr_hits": rep.get("ocr_hits"),
-                "ocr_mean_conf": rep.get("ocr_mean_conf"),
-
-                # Combined verdict for BACK (no face gate)
-                "verified": bool(rep.get("verified")),
-
-                # housekeeping
+                "qr_detected": bool(qr_ok),
+                "verified": bool(overlap_ok and size_ok and qr_ok),  # ← Use debounced values
                 "skipped": False,
             }
 
