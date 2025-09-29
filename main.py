@@ -564,13 +564,12 @@ async def websocket_id_back_live(ws: WebSocket):
     (base / "id_back").mkdir(parents=True, exist_ok=True)
 
     STREAK_N = int(os.getenv("ID_BACK_STREAK_N", os.getenv("ID_STREAK_N", "3")))
-    OCR_STREAK_N = max(1, STREAK_N // 2)
 
     streaks = {
         "id_card_detected": BoolStreak(STREAK_N),
         "id_overlap_ok":    BoolStreak(STREAK_N),
         "id_size_ok":       BoolStreak(STREAK_N),
-        "ocr_ok":           BoolStreak(OCR_STREAK_N),
+        "qr_detected":      BoolStreak(STREAK_N),
     }
 
     frame_idx = 0
@@ -590,7 +589,6 @@ async def websocket_id_back_live(ws: WebSocket):
             H, W = frame.shape[:2]
             frame_idx += 1
 
-            # throttle (mirror front behavior)
             if frame_idx % 5 != 0 and last_payload is not None:
                 payload = dict(last_payload)
                 payload["skipped"] = True
@@ -599,14 +597,12 @@ async def websocket_id_back_live(ws: WebSocket):
                 await ws.send_json(_to_jsonable(payload))
                 continue
 
-            # ⬇️ analyze BACK side (no face checks inside)
             rep = analyze_id_back_frame(frame)
 
-            # Debounce relevant gates
             id_card_ok = streaks["id_card_detected"].update(rep.get("id_card_detected"))
             overlap_ok = streaks["id_overlap_ok"].update(rep.get("id_overlap_ok"))
             size_ok    = streaks["id_size_ok"].update(rep.get("id_size_ok"))
-            ocr_ok     = streaks["ocr_ok"].update(rep.get("ocr_ok"))
+            qr_ok      = streaks["qr_detected"].update(rep.get("qr_detected"))
 
             payload = {
                 "req_id": req_id,
@@ -625,7 +621,7 @@ async def websocket_id_back_live(ws: WebSocket):
                 "id_size_ok": bool(size_ok),
                 "id_size_ratio": rep.get("id_size_ratio"),
                 "qr_detected": bool(qr_ok),
-                "verified": bool(overlap_ok and size_ok and qr_ok),  # ← Use debounced values
+                "verified": bool(id_card_ok and overlap_ok and size_ok and qr_ok),
                 "skipped": False,
             }
 
