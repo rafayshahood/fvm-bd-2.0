@@ -319,7 +319,7 @@ def analyze_id_back_frame(
     rect_w_ratio: float = RECT_W_RATIO,
     rect_h_ratio: float = RECT_H_RATIO,
 ) -> Dict[str, Optional[object]]:
-    """BACK side analyzer: brightness → ID detection → overlap/size → QR CODE only."""
+    """BACK side analyzer: brightness → ID detection → overlap/size → QR CODE (no AR check)."""
     H, W = image_bgr.shape[:2]
     out: Dict[str, Optional[object]] = {
         "rect": None, "roi_xyxy": None,
@@ -327,7 +327,6 @@ def analyze_id_back_frame(
         "id_card_detected": False, "id_card_bbox": None, "id_card_conf": None,
         "id_frac_in": None, "id_overlap_ok": None,
         "id_size_ratio": None, "id_size_ok": None,
-        "id_ar": None,
         "qr_detected": None,
         "verified": False,
     }
@@ -338,6 +337,7 @@ def analyze_id_back_frame(
     out["rect"] = [float(rx), float(ry), float(rw), float(rh)]
     out["roi_xyxy"] = [gx1, gy1, gx2, gy2]
 
+    # (0) Brightness
     b_ok, b_mean, b_status = _brightness_eval(image_bgr)
     out["brightness_ok"] = bool(b_ok)
     out["brightness_mean"] = float(b_mean)
@@ -345,6 +345,7 @@ def analyze_id_back_frame(
     if not b_ok:
         return out
 
+    # (1) Detect ID in ROI
     id_ok, id_bbox, id_conf = _detect_id_card_in_roi(image_bgr, guide_xyxy)
     out["id_card_detected"] = bool(id_ok)
     out["id_card_bbox"] = list(id_bbox) if id_bbox else None
@@ -352,24 +353,35 @@ def analyze_id_back_frame(
     if not id_ok:
         return out
 
+    # Geometry checks (NO AR CHECK for back side)
     x1, y1, x2, y2 = id_bbox
-    ar_ok, ar = _aspect_ok(x2 - x1, y2 - y1); out["id_ar"] = float(ar)
-    inter, frac_in, inter_area = _rect_intersect(id_bbox, guide_xyxy); out["id_frac_in"] = float(frac_in)
-    if inter is None or frac_in < OVERLAP_MIN: out["id_overlap_ok"] = False; return out
+    inter, frac_in, inter_area = _rect_intersect(id_bbox, guide_xyxy)
+    out["id_frac_in"] = float(frac_in)
+    
+    if inter is None or frac_in < OVERLAP_MIN:
+        out["id_overlap_ok"] = False
+        return out
     out["id_overlap_ok"] = True
+    
     guide_area = float((gx2 - gx1) * (gy2 - gy1)) + 1e-6
-    size_ratio = inter_area / guide_area; out["id_size_ratio"] = float(size_ratio)
+    size_ratio = inter_area / guide_area
+    out["id_size_ratio"] = float(size_ratio)
     out["id_size_ok"] = bool(size_ratio >= MIN_GUIDE_COVER_FRAC)
-    if not out["id_size_ok"]: return out
-    if not _area_frac_ok(x1, y1, x2, y2, W, H): return out
-    if not ar_ok: return out
+    
+    if not out["id_size_ok"]:
+        return out
+    
+    # Skip area fraction and AR checks - go straight to QR detection
 
+    # Crop for QR detection
     ix1, iy1, ix2, iy2 = map(int, inter)
     id_crop = image_bgr[iy1:iy2, ix1:ix2]
 
+    # QR CODE detection
     qr_found = _detect_qr_code(id_crop)
     out["qr_detected"] = bool(qr_found)
 
+    # Final verdict (back): overlap + size + QR code (no AR requirement)
     out["verified"] = bool(out["id_overlap_ok"] and out["id_size_ok"] and out["qr_detected"])
     return out
 
