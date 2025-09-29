@@ -1,6 +1,6 @@
 # id.py — shared analyzers for front and back sides of ID
 # Front: brightness → ID-in-ROI → overlap/size/area/ar → FACE-on-ID → OCR
-# Back:  brightness → ID-in-ROI → overlap/size/area/ar → QR CODE (no OCR, no face)
+# Back:  brightness → ID-in-ROI → overlap/size → QR CODE (entire guide region)
 
 from __future__ import annotations
 from pathlib import Path
@@ -11,9 +11,10 @@ import cv2
 import numpy as np
 import torch
 from ultralytics import YOLO
-from PIL import Image  # enhancement fallback for FRONT only
+from PIL import Image
 from rapidfuzz import fuzz
 import easyocr
+from qreader import QReader
 
 # ---- Optional GFPGAN import (used by FRONT enhancement helper only) ----
 ENHANCER_AVAILABLE = False
@@ -37,6 +38,9 @@ print(f"🖥️ Using device: {DEVICE.upper()}")
 
 FACE_MODEL = YOLO("yolov8n-face-lindevs.pt")
 ID_MODEL   = YOLO("iddetection.pt")
+
+# QReader instance for QR detection
+qreader_instance = QReader()
 
 # -----------------------------------------------------------------------------
 # Config — thresholds / gates
@@ -230,11 +234,30 @@ def _ocr_verify_crop_inside_custom(
     return ok, mean_conf, hits, joined, inside_ratio
 
 def _detect_qr_code(image_bgr: np.ndarray) -> bool:
-    """Detect if image contains a QR code using OpenCV."""
+    """Detect QR code using qreader library (more robust than OpenCV)."""
     try:
-        detector = cv2.QRCodeDetector()
-        data, bbox, _ = detector.detectAndDecode(image_bgr)
-        return bbox is not None and len(bbox) > 0
+        # qreader works with BGR images directly
+        detected_qr_codes = qreader_instance.detect(image_bgr)
+        
+        if detected_qr_codes and len(detected_qr_codes) > 0:
+            # Try to decode to confirm it's a valid QR code
+            try:
+                decoded = qreader_instance.detect_and_decode(image_bgr)
+                if decoded and len(decoded) > 0:
+                    print(f"✓ QR detected and decoded: {decoded[0][:50] if decoded[0] else 'empty'}")
+                    return True
+                else:
+                    # Detected but couldn't decode - still count as QR present
+                    print("✓ QR detected (decode failed, but QR present)")
+                    return True
+            except:
+                # Detection succeeded even if decode failed
+                print("✓ QR detected (decode error, but QR present)")
+                return True
+        
+        print("✗ No QR code detected")
+        return False
+        
     except Exception as e:
         print(f"⚠️ QR detection error: {e}")
         return False
@@ -319,7 +342,7 @@ def analyze_id_back_frame(
     rect_w_ratio: float = RECT_W_RATIO,
     rect_h_ratio: float = RECT_H_RATIO,
 ) -> Dict[str, Optional[object]]:
-    """BACK side analyzer: brightness → ID detection → overlap/size → QR CODE (no AR check)."""
+    """BACK side analyzer: brightness → ID detection → QR in ENTIRE GUIDE REGION."""
     H, W = image_bgr.shape[:2]
     out: Dict[str, Optional[object]] = {
         "rect": None, "roi_xyxy": None,
@@ -337,7 +360,6 @@ def analyze_id_back_frame(
     out["rect"] = [float(rx), float(ry), float(rw), float(rh)]
     out["roi_xyxy"] = [gx1, gy1, gx2, gy2]
 
-    # (0) Brightness
     b_ok, b_mean, b_status = _brightness_eval(image_bgr)
     out["brightness_ok"] = bool(b_ok)
     out["brightness_mean"] = float(b_mean)
@@ -345,7 +367,6 @@ def analyze_id_back_frame(
     if not b_ok:
         return out
 
-    # (1) Detect ID in ROI
     id_ok, id_bbox, id_conf = _detect_id_card_in_roi(image_bgr, guide_xyxy)
     out["id_card_detected"] = bool(id_ok)
     out["id_card_bbox"] = list(id_bbox) if id_bbox else None
@@ -353,7 +374,6 @@ def analyze_id_back_frame(
     if not id_ok:
         return out
 
-    # Geometry checks (NO AR CHECK for back side)
     x1, y1, x2, y2 = id_bbox
     inter, frac_in, inter_area = _rect_intersect(id_bbox, guide_xyxy)
     out["id_frac_in"] = float(frac_in)
@@ -370,18 +390,14 @@ def analyze_id_back_frame(
     
     if not out["id_size_ok"]:
         return out
-    
-    # Skip area fraction and AR checks - go straight to QR detection
 
-    # Crop for QR detection
-    ix1, iy1, ix2, iy2 = map(int, inter)
-    id_crop = image_bgr[iy1:iy2, ix1:ix2]
-
-    # QR CODE detection
-    qr_found = _detect_qr_code(id_crop)
+    # QR detection: scan ENTIRE GUIDE REGION (not just detected ID box)
+    # This ensures we catch the QR even if ID detection box is incomplete
+    guide_crop = image_bgr[gy1:gy2, gx1:gx2]
+    qr_found = _detect_qr_code(guide_crop)
     out["qr_detected"] = bool(qr_found)
 
-    # Final verdict (back): overlap + size + QR code (no AR requirement)
+    # Final verdict: ID present + overlap + size + QR detected
     out["verified"] = bool(out["id_overlap_ok"] and out["id_size_ok"] and out["qr_detected"])
     return out
 
