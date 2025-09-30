@@ -1,10 +1,11 @@
-# id.py — optimized with OCR caching and conditional execution
+# id.py — shared analyzers for front and back sides of ID
+# Front: brightness → ID-in-ROI → overlap/size/area/ar → FACE-on-ID → OCR
+# Back:  brightness → ID-in-ROI → overlap/size → QR CODE (entire guide region)
+
 from __future__ import annotations
 from pathlib import Path
 from typing import Dict, Optional, Tuple, List
 import os, sys, re
-import time
-import hashlib
 
 import cv2
 import numpy as np
@@ -92,90 +93,6 @@ RGX_FRONT = [
     r"\b(NUIP|N\.U\.I\.P\.?)\b",
     r"\b\d{1,3}\.\d{3}\.\d{3}\.\d{1,4}\b"
 ]
-
-# -----------------------------------------------------------------------------
-# OCR Cache System
-# -----------------------------------------------------------------------------
-class OCRCache:
-    def __init__(self, ttl_ms=3000):
-        self.cache = {}
-        self.ttl_ms = ttl_ms
-    
-    def get_key(self, img_crop):
-        """Generate a hash key for the image crop"""
-        h, w = img_crop.shape[:2]
-        # Create a simple hash of the image
-        img_hash = hashlib.md5(cv2.resize(img_crop, (64, 64)).tobytes()).hexdigest()[:8]
-        return f"{w}x{h}_{img_hash}"
-    
-    def get(self, img_crop):
-        """Get cached OCR result if available and not expired"""
-        key = self.get_key(img_crop)
-        if key in self.cache:
-            result, timestamp = self.cache[key]
-            if (time.time() * 1000) - timestamp < self.ttl_ms:
-                return result
-            else:
-                # Expired, remove it
-                del self.cache[key]
-        return None
-    
-    def set(self, img_crop, result):
-        """Cache OCR result"""
-        key = self.get_key(img_crop)
-        self.cache[key] = (result, time.time() * 1000)
-        # Prevent cache from growing too large
-        if len(self.cache) > 20:
-            # Remove oldest entries
-            sorted_items = sorted(self.cache.items(), key=lambda x: x[1][1])
-            for old_key, _ in sorted_items[:10]:
-                del self.cache[old_key]
-
-# Global OCR cache instance
-ocr_cache = OCRCache(ttl_ms=3000)
-
-# -----------------------------------------------------------------------------
-# Session-based OCR results storage
-# -----------------------------------------------------------------------------
-class SessionOCRStore:
-    def __init__(self):
-        self.results = {}
-        self.stable_counts = {}
-        self.last_states = {}
-    
-    def is_stable_for_ocr(self, req_id: str, state_tuple: tuple) -> bool:
-        """Check if conditions have been stable for enough frames"""
-        if req_id not in self.last_states:
-            self.last_states[req_id] = state_tuple
-            self.stable_counts[req_id] = 0
-            return False
-        
-        if self.last_states[req_id] == state_tuple:
-            self.stable_counts[req_id] += 1
-        else:
-            self.stable_counts[req_id] = 0
-            self.last_states[req_id] = state_tuple
-        
-        # Require 2 stable frames before running OCR
-        return self.stable_counts[req_id] >= 2
-    
-    def has_result(self, req_id: str) -> bool:
-        return req_id in self.results
-    
-    def get_result(self, req_id: str) -> Optional[tuple]:
-        return self.results.get(req_id)
-    
-    def store_result(self, req_id: str, result: tuple):
-        self.results[req_id] = result
-    
-    def clear_session(self, req_id: str):
-        """Clear session data when ID verification is complete"""
-        self.results.pop(req_id, None)
-        self.stable_counts.pop(req_id, None)
-        self.last_states.pop(req_id, None)
-
-# Global session OCR store
-session_ocr_store = SessionOCRStore()
 
 # -----------------------------------------------------------------------------
 # Helpers
@@ -279,13 +196,6 @@ def _ocr_verify_crop_inside_custom(
     crop_bgr: np.ndarray, ix1: int, iy1: int, guide_xyxy, kw_list: List[str], rgx_list: List[str],
     required_hits: int = OCR_REQUIRED_HITS, min_conf: float = OCR_MIN_CONF, fuzzy: int = FUZZY
 ):
-    # Check cache first
-    cached_result = ocr_cache.get(crop_bgr)
-    if cached_result is not None:
-        print("📦 Using cached OCR result")
-        return cached_result
-    
-    # Run OCR
     res = reader_primary.readtext(crop_bgr, detail=1, paragraph=False)
     if not res:
         try:
@@ -294,10 +204,7 @@ def _ocr_verify_crop_inside_custom(
             res = []
             
     if not res:
-        result = (False, 0.0, 0, "", 0.0)
-        ocr_cache.set(crop_bgr, result)
-        return result
-    
+        return False, 0.0, 0, "", 0.0
     texts, confs, inside = [], [], []
     gx1, gy1, gx2, gy2 = guide_xyxy
     for (pts, txt, conf) in res:
@@ -308,15 +215,11 @@ def _ocr_verify_crop_inside_custom(
         inside.append(gx1 <= cx <= gx2 and gy1 <= cy <= gy2)
         texts.append(txt); confs.append(float(conf))
     if not texts:
-        result = (False, 0.0, 0, "", 0.0)
-        ocr_cache.set(crop_bgr, result)
-        return result
+        return False, 0.0, 0, "", 0.0
 
     inside_ratio = (sum(inside) / max(1, len(inside)))
     if inside_ratio < OCR_BOX_KEEP_PCT:
-        result = (False, float(np.mean(confs)), 0, " ".join(texts).lower(), inside_ratio)
-        ocr_cache.set(crop_bgr, result)
-        return result
+        return False, float(np.mean(confs)), 0, " ".join(texts).lower(), inside_ratio
 
     joined = " ".join(texts).lower()
     hits = 0
@@ -328,29 +231,27 @@ def _ocr_verify_crop_inside_custom(
             hits += 1
     mean_conf = float(np.mean(confs))
     ok = (hits >= required_hits) and (mean_conf >= min_conf)
-    result = (ok, mean_conf, hits, joined, inside_ratio)
-    
-    # Cache the result
-    ocr_cache.set(crop_bgr, result)
-    print(f"🔍 OCR executed: hits={hits}, conf={mean_conf:.2f}, ok={ok}")
-    
-    return result
+    return ok, mean_conf, hits, joined, inside_ratio
 
 def _detect_qr_code(image_bgr: np.ndarray) -> bool:
     """Detect QR code using qreader library (more robust than OpenCV)."""
     try:
+        # qreader works with BGR images directly
         detected_qr_codes = qreader_instance.detect(image_bgr)
         
         if detected_qr_codes and len(detected_qr_codes) > 0:
+            # Try to decode to confirm it's a valid QR code
             try:
                 decoded = qreader_instance.detect_and_decode(image_bgr)
                 if decoded and len(decoded) > 0:
                     print(f"✓ QR detected and decoded: {decoded[0][:50] if decoded[0] else 'empty'}")
                     return True
                 else:
+                    # Detected but couldn't decode - still count as QR present
                     print("✓ QR detected (decode failed, but QR present)")
                     return True
             except:
+                # Detection succeeded even if decode failed
                 print("✓ QR detected (decode error, but QR present)")
                 return True
         
@@ -368,9 +269,8 @@ def analyze_id_frame(
     image_bgr: np.ndarray,
     rect_w_ratio: float = RECT_W_RATIO,
     rect_h_ratio: float = RECT_H_RATIO,
-    req_id: Optional[str] = None,  # NEW: pass req_id for session tracking
 ) -> Dict[str, Optional[object]]:
-    """FRONT side analyzer with optimized OCR execution."""
+    """FRONT side analyzer (unchanged behavior)."""
     H, W = image_bgr.shape[:2]
     out: Dict[str, Optional[object]] = {
         "rect": None, "roi_xyxy": None,
@@ -425,46 +325,9 @@ def analyze_id_frame(
         fx1, fy1, fx2, fy2 = f_box
         out["largest_bbox"] = [ix1 + fx1, iy1 + fy1, ix1 + fx2, iy1 + fy2]
 
-    # OPTIMIZED OCR EXECUTION
-    if req_id:
-        # Check if we already have OCR result for this session
-        if session_ocr_store.has_result(req_id):
-            # Use stored result
-            ocr_result = session_ocr_store.get_result(req_id)
-            ocr_ok, mean_conf, hits, _joined, inside_ratio = ocr_result
-            print(f"📋 Using session OCR result for {req_id}")
-        else:
-            # Check if conditions are stable enough to run OCR
-            current_state = (
-                out["id_overlap_ok"],
-                out["id_size_ok"],
-                out["face_on_id"],
-                ar_ok
-            )
-            
-            if session_ocr_store.is_stable_for_ocr(req_id, current_state):
-                # Conditions are stable, run OCR once
-                ocr_ok, mean_conf, hits, _joined, inside_ratio = _ocr_verify_crop_inside_custom(
-                    id_crop, ix1, iy1, guide_xyxy, KW_FRONT, RGX_FRONT, OCR_REQUIRED_HITS, OCR_MIN_CONF, FUZZY
-                )
-                # Store result for this session
-                session_ocr_store.store_result(req_id, (ocr_ok, mean_conf, hits, _joined, inside_ratio))
-                print(f"💾 Stored OCR result for session {req_id}")
-            else:
-                # Not stable yet, return pending status
-                out["ocr_ok"] = None
-                out["ocr_inside_ratio"] = 0.0
-                out["ocr_hits"] = 0
-                out["ocr_mean_conf"] = 0.0
-                out["verified"] = False
-                print(f"⏳ Waiting for stable conditions before OCR")
-                return out
-    else:
-        # Fallback: run OCR normally if no req_id provided
-        ocr_ok, mean_conf, hits, _joined, inside_ratio = _ocr_verify_crop_inside_custom(
-            id_crop, ix1, iy1, guide_xyxy, KW_FRONT, RGX_FRONT, OCR_REQUIRED_HITS, OCR_MIN_CONF, FUZZY
-        )
-    
+    ocr_ok, mean_conf, hits, _joined, inside_ratio = _ocr_verify_crop_inside_custom(
+        id_crop, ix1, iy1, guide_xyxy, KW_FRONT, RGX_FRONT, OCR_REQUIRED_HITS, OCR_MIN_CONF, FUZZY
+    )
     out["ocr_ok"] = bool(ocr_ok)
     out["ocr_inside_ratio"] = float(inside_ratio)
     out["ocr_hits"] = int(hits)
@@ -528,21 +391,19 @@ def analyze_id_back_frame(
     if not out["id_size_ok"]:
         return out
 
+    # QR detection: scan ENTIRE GUIDE REGION (not just detected ID box)
+    # This ensures we catch the QR even if ID detection box is incomplete
     guide_crop = image_bgr[gy1:gy2, gx1:gx2]
     qr_found = _detect_qr_code(guide_crop)
     out["qr_detected"] = bool(qr_found)
 
+    # Final verdict: ID present + overlap + size + QR detected
     out["verified"] = bool(out["id_overlap_ok"] and out["id_size_ok"] and out["qr_detected"])
     return out
 
-
-def clear_ocr_session(req_id: str):
-    """Clear OCR session data when ID verification is complete"""
-    session_ocr_store.clear_session(req_id)
-    print(f"🧹 Cleared OCR session for {req_id}")
-
-
-# Enhancement & face-crop functions remain unchanged
+# -----------------------------------------------------------------------------
+# Enhancement & face-crop-on-still (FRONT only; unchanged)
+# -----------------------------------------------------------------------------
 def enhance_id_image(input_path: str, output_path: str) -> bool:
     if ENHANCER_AVAILABLE:
         model_path = "GFPGAN/experiments/pretrained_models/GFPGANv1.3.pth"
@@ -617,5 +478,4 @@ __all__ = [
     "analyze_id_back_frame",
     "run_id_extraction",
     "enhance_id_image",
-    "clear_ocr_session",  # NEW export
 ]
