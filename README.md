@@ -68,7 +68,9 @@ pip install onnxruntime-gpu face-recognition==1.3.0 albumentations==1.3.0 decord
 pip install torch==2.1.0+cu118 torchvision==0.16.0+cu118 torchaudio==2.1.0+cu118 \
   --index-url https://download.pytorch.org/whl/cu118
 
-pip install easyocr==1.7.1 rapidfuzz
+pip install easyocr==1.7.1 rapidfuzz qreader
+
+apt-get install -y libzbar0 libzbar-dev (if ubuntu)
 
 ```
 
