@@ -70,8 +70,6 @@ pip install torch==2.1.0+cu118 torchvision==0.16.0+cu118 torchaudio==2.1.0+cu118
 
 pip install easyocr==1.7.1 rapidfuzz qreader
 
-apt-get install -y libzbar0 libzbar-dev (if ubuntu)
-
 ```
 
 ---
@@ -126,9 +124,15 @@ From the main repo folder:
 
 ---
 
+### Step 9:
+```bash
+ apt-get install -y libzbar0 libzbar-dev (if ubuntu)
+
+```
+
 ---
 
-### Step 9: Install Correct Numpy Version (Optional if library issue occurs)
+### Step 10: Install Correct Numpy Version (Optional if library issue occurs)
 From the main repo folder:
 ```bash
  pip install --force-reinstall --no-cache-dir numpy==1.26.4
