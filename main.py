@@ -382,8 +382,6 @@ async def req_state(req_id: str, request: Request):
 # ------------------------------------------------------------------------------
 # LIVE ID WebSocket — EXACT new-script conditions + full metrics + frame size
 # ------------------------------------------------------------------------------
-# Replace the websocket_id_live function in main.py with this optimized version
-
 @app.websocket("/ws-id-live")
 async def websocket_id_live(ws: WebSocket):
     await ws.accept()
@@ -392,21 +390,19 @@ async def websocket_id_live(ws: WebSocket):
     base = Path("temp") / req_id
     (base / "id").mkdir(parents=True, exist_ok=True)
 
-    STREAK_N = int(os.getenv("ID_STREAK_N", "1"))  # Reduced from 2 for faster response
-    OCR_STREAK_N = 1  # Immediate OCR response when ready
+    STREAK_N = int(os.getenv("ID_STREAK_N", "2"))
+    OCR_STREAK_N = max(1, STREAK_N // 2)  # ← halve OCR stability requirement
 
     streaks = {
         "id_card_detected": BoolStreak(STREAK_N),
         "id_overlap_ok":    BoolStreak(STREAK_N),
         "id_size_ok":       BoolStreak(STREAK_N),
         "face_on_id":       BoolStreak(STREAK_N),
-        "ocr_ok":           BoolStreak(OCR_STREAK_N),
+        "ocr_ok":           BoolStreak(OCR_STREAK_N),  # ← use halved value here
     }
 
     frame_idx = 0
     last_payload: Optional[dict] = None
-    verification_complete = False
-    
     try:
         while True:
             data = await ws.receive_text()
@@ -422,8 +418,8 @@ async def websocket_id_live(ws: WebSocket):
             H, W = frame.shape[:2]
             frame_idx += 1
 
-            # Changed from % 3 to % 2 for better responsiveness
-            if frame_idx % 2 != 0 and last_payload is not None:
+            # throttle: send every 5th frame if we already sent one recently
+            if frame_idx % 3 != 0 and last_payload is not None:
                 payload = dict(last_payload)
                 payload["skipped"] = True
                 payload["frame_w"] = int(W)
@@ -431,68 +427,65 @@ async def websocket_id_live(ws: WebSocket):
                 await ws.send_json(_to_jsonable(payload))
                 continue
 
-            # Import the optimized analyze function and pass req_id
-            from id import analyze_id_frame, clear_ocr_session
-            rep = analyze_id_frame(frame, req_id=req_id)  # Pass req_id for session tracking
+            rep = analyze_id_frame(frame)
 
-            # Debounce gates
+            # Debounce gates (like the demo's "stable" counter)
             id_card_ok = streaks["id_card_detected"].update(rep.get("id_card_detected"))
             overlap_ok = streaks["id_overlap_ok"].update(rep.get("id_overlap_ok"))
             size_ok    = streaks["id_size_ok"].update(rep.get("id_size_ok"))
             face_ok    = streaks["face_on_id"].update(rep.get("face_on_id"))
-            
-            # Handle OCR result
-            ocr_result = rep.get("ocr_ok")
-            if ocr_result is None:
-                # OCR pending (conditions not stable yet)
-                ocr_ok = None
-            else:
-                # OCR has been executed, use immediate result
-                ocr_ok = bool(ocr_result)
+            ocr_ok     = streaks["ocr_ok"].update(rep.get("ocr_ok"))
 
             payload = {
                 "req_id": req_id,
+
+                # Frame size (so FE can map boxes 1:1 even if we downscale)
                 "frame_w": int(W),
                 "frame_h": int(H),
+
+                # Geometry for FE overlay (rect is in frame coords)
                 "rect": rep.get("rect"),
                 "roi_xyxy": rep.get("roi_xyxy"),
+
+                # Brightness — first gate
                 "brightness_ok": rep.get("brightness_ok"),
                 "brightness_status": rep.get("brightness_status"),
                 "brightness_mean": rep.get("brightness_mean"),
+
+                # Detections
                 "id_card_detected": bool(id_card_ok),
                 "id_card_bbox": rep.get("id_card_bbox"),
                 "id_card_conf": rep.get("id_card_conf"),
+
+                # Gates (debounced booleans) + raw metrics (not debounced)
                 "id_overlap_ok": bool(overlap_ok),
                 "id_frac_in": rep.get("id_frac_in"),
                 "id_size_ok": bool(size_ok),
                 "id_size_ratio": rep.get("id_size_ratio"),
                 "id_ar": rep.get("id_ar"),
+
+                # Face-on-ID
                 "face_on_id": bool(face_ok),
                 "largest_bbox": rep.get("largest_bbox"),
-                "ocr_ok": ocr_ok,  # Can be None (pending), True, or False
+
+                # OCR metrics (always computed once size+overlap+ar ok)
+                "ocr_ok": bool(ocr_ok),
                 "ocr_inside_ratio": rep.get("ocr_inside_ratio"),
                 "ocr_hits": rep.get("ocr_hits"),
                 "ocr_mean_conf": rep.get("ocr_mean_conf"),
+
+                # Combined verdict (not debounced)
                 "verified": bool(rep.get("verified")),
+
+                # housekeeping
                 "skipped": False,
                 "saved": False,
             }
 
-            # Track if verification is complete
-            if rep.get("verified") and not verification_complete:
-                verification_complete = True
-                print(f"✅ ID verification complete for {req_id}")
-
             last_payload = payload
             await ws.send_json(_to_jsonable(payload))
-            
     except WebSocketDisconnect:
         print(f"🔌 ID live verification ended for {req_id}")
-        
-        # Clean up OCR session data when WebSocket closes
-        from id import clear_ocr_session
-        clear_ocr_session(req_id)
-        print(f"🧹 Cleared OCR cache for session {req_id}")
 
         
 
