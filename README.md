@@ -37,8 +37,8 @@ source env/bin/activate
 ### Step 2: Clone the repository
 
 ```bash
-git clone https://github.com/rafayshahood/fvm-bd.git
-cd fvm-bd
+git clone https://github.com/rafayshahood/fvm-bd-2.0.git
+cd fvm-bd-2.0
 ```
 
 ---
@@ -141,7 +141,7 @@ From the main repo folder:
 
 ---
 
-### Step 10: Run the Backend
+### Step 11: Run the Backend
 
 ```bash
 uvicorn main:app --host 0.0.0.0 --port 8888
