@@ -124,9 +124,9 @@ From the main repo folder:
 
 ---
 
-### Step 9:
+### Step 9: (Optional if ubuntu)
 ```bash
- apt-get install -y libzbar0 libzbar-dev (if ubuntu)
+ apt-get install -y libzbar0 libzbar-dev 
 
 ```
 
