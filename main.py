@@ -376,6 +376,12 @@ async def req_state(req_id: str, request: Request):
 # ------------------------------------------------------------------------------
 # LIVE ID WebSocket (front side — NEW conditions only)
 # ------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
+# LIVE ID WebSocket — EXACT new-script conditions + full metrics + frame size
+# ------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
+# LIVE ID WebSocket — EXACT new-script conditions + full metrics + frame size
+# ------------------------------------------------------------------------------
 @app.websocket("/ws-id-live")
 async def websocket_id_live(ws: WebSocket):
     await ws.accept()
@@ -384,17 +390,18 @@ async def websocket_id_live(ws: WebSocket):
     base = Path("temp") / req_id
     (base / "id").mkdir(parents=True, exist_ok=True)
 
-    STREAK_N = int(os.getenv("ID_STREAK_N", "3"))
-    OCR_STREAK_N = max(1, STREAK_N // 2)
+    STREAK_N = int(os.getenv("ID_STREAK_N", "2"))
+    OCR_STREAK_N = max(1, STREAK_N // 2)  # ← halve OCR stability requirement
 
     streaks = {
         "id_card_detected": BoolStreak(STREAK_N),
         "id_overlap_ok":    BoolStreak(STREAK_N),
         "id_size_ok":       BoolStreak(STREAK_N),
         "face_on_id":       BoolStreak(STREAK_N),
-        "ocr_ok":           BoolStreak(OCR_STREAK_N),
+        "ocr_ok":           BoolStreak(OCR_STREAK_N),  # ← use halved value here
     }
 
+    frame_idx = 0
     last_payload: Optional[dict] = None
     try:
         while True:
@@ -409,10 +416,20 @@ async def websocket_id_live(ws: WebSocket):
                 continue
 
             H, W = frame.shape[:2]
+            frame_idx += 1
 
-            # Process EVERY frame (removed throttling)
+            # throttle: send every 5th frame if we already sent one recently
+            if frame_idx % 5 != 0 and last_payload is not None:
+                payload = dict(last_payload)
+                payload["skipped"] = True
+                payload["frame_w"] = int(W)
+                payload["frame_h"] = int(H)
+                await ws.send_json(_to_jsonable(payload))
+                continue
+
             rep = analyze_id_frame(frame)
 
+            # Debounce gates (like the demo's "stable" counter)
             id_card_ok = streaks["id_card_detected"].update(rep.get("id_card_detected"))
             overlap_ok = streaks["id_overlap_ok"].update(rep.get("id_overlap_ok"))
             size_ok    = streaks["id_size_ok"].update(rep.get("id_size_ok"))
@@ -421,28 +438,46 @@ async def websocket_id_live(ws: WebSocket):
 
             payload = {
                 "req_id": req_id,
+
+                # Frame size (so FE can map boxes 1:1 even if we downscale)
                 "frame_w": int(W),
                 "frame_h": int(H),
+
+                # Geometry for FE overlay (rect is in frame coords)
                 "rect": rep.get("rect"),
                 "roi_xyxy": rep.get("roi_xyxy"),
+
+                # Brightness — first gate
                 "brightness_ok": rep.get("brightness_ok"),
                 "brightness_status": rep.get("brightness_status"),
                 "brightness_mean": rep.get("brightness_mean"),
+
+                # Detections
                 "id_card_detected": bool(id_card_ok),
                 "id_card_bbox": rep.get("id_card_bbox"),
                 "id_card_conf": rep.get("id_card_conf"),
+
+                # Gates (debounced booleans) + raw metrics (not debounced)
                 "id_overlap_ok": bool(overlap_ok),
                 "id_frac_in": rep.get("id_frac_in"),
                 "id_size_ok": bool(size_ok),
                 "id_size_ratio": rep.get("id_size_ratio"),
                 "id_ar": rep.get("id_ar"),
+
+                # Face-on-ID
                 "face_on_id": bool(face_ok),
                 "largest_bbox": rep.get("largest_bbox"),
+
+                # OCR metrics (always computed once size+overlap+ar ok)
                 "ocr_ok": bool(ocr_ok),
                 "ocr_inside_ratio": rep.get("ocr_inside_ratio"),
                 "ocr_hits": rep.get("ocr_hits"),
                 "ocr_mean_conf": rep.get("ocr_mean_conf"),
+
+                # Combined verdict (not debounced)
                 "verified": bool(rep.get("verified")),
+
+                # housekeeping
                 "skipped": False,
                 "saved": False,
             }
