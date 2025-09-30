@@ -419,7 +419,7 @@ async def websocket_id_live(ws: WebSocket):
             frame_idx += 1
 
             # throttle: send every 5th frame if we already sent one recently
-            if frame_idx % 5 != 0 and last_payload is not None:
+            if frame_idx % 3 != 0 and last_payload is not None:
                 payload = dict(last_payload)
                 payload["skipped"] = True
                 payload["frame_w"] = int(W)
