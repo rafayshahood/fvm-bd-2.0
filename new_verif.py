@@ -32,7 +32,7 @@ def enhance_image(image):
     enhanced = cv2.equalizeHist(gray)
     return cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
 
-def run_verif(id_image_path: str, frames_dir: str, output_path: str):
+def run_verif(id_image_path: str, frames_dir: str, output_path: str, id_display_path: str = None):
     """
     Compare embeddings between an ID image and multiple frames, save side-by-side best match.
 
@@ -91,9 +91,16 @@ def run_verif(id_image_path: str, frames_dir: str, output_path: str):
         status = '❌ Unverified'
 
     # Create and save combined image
-    img_id = cv2.imread(str(id_path))
+    display_path = Path(id_display_path) if id_display_path else id_path
+    if not display_path.exists():
+        print(f"⚠️ Display image {display_path} not found, falling back to {id_path}")
+        display_path = id_path
+
+    img_id = cv2.imread(str(display_path)) 
     img_best = cv2.imread(str(Path(frames_dir) / best_match_file))
+
     h = 300
+    
     def resize_to_height(img, height):
         return cv2.resize(img, (int(img.shape[1] * height / img.shape[0]), height))
     id_resized = resize_to_height(img_id, h)
