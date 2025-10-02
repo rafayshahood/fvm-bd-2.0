@@ -492,16 +492,14 @@ async def websocket_id_live(ws: WebSocket):
 # ------------------------------------------------------------------------------
 # ID still upload (FRONT) — saves still and crops face for verification
 # ------------------------------------------------------------------------------
-# ------------------------------------------------------------------------------
-# ID still upload (FRONT) — expects FULL FRAME; enhance → crop; keep only needed files
-# ------------------------------------------------------------------------------
 @app.post("/upload-id-still")
-async def upload_id_still(request: Request, image: UploadFile = File(...)):
+async def upload_id_still(request: Request, image: UploadFile = File(...), id_crop: Optional[UploadFile] = File(None)):
     """
-    Accepts ONE file 'image' which must be the FULL camera frame.
-    Saves to id_frame_raw.jpg, enhances to id_frame_enhanced.jpg,
-    crops the ID portrait face; deletes raw if enhancement succeeds.
-    Returns direct URLs without relying on legacy filenames.
+    Accepts TWO files:
+    - 'image': FULL camera frame (required)
+    - 'id_crop': cropped ID region (optional)
+    
+    Saves full frame, enhances, crops face; also saves id_crop if provided.
     """
     req_id = _req_id_from(request)
     paths = _base_paths(req_id)
@@ -512,6 +510,11 @@ async def upload_id_still(request: Request, image: UploadFile = File(...)):
     # Save full frame (raw)
     id_raw_full = id_dir / "id_frame_raw.jpg"
     id_raw_full.write_bytes(await image.read())
+
+    # Save cropped ID region if provided
+    if id_crop:
+        id_crop_path = id_dir / "id_crop_raw.jpg"
+        id_crop_path.write_bytes(await id_crop.read())
 
     # Enhance (best effort)
     used_for_cropping = id_raw_full
@@ -539,16 +542,18 @@ async def upload_id_still(request: Request, image: UploadFile = File(...)):
         except Exception:
             pass
 
-    # Build URLs explicitly (avoid legacy helpers)
+    # Build URLs explicitly
     id_image_name = "id_frame_enhanced.jpg" if enhanced_ok else "id_frame_raw.jpg"
     id_image_url = _abs_url(request, f"/temp/{req_id}/id/{id_image_name}")
     cropped_url = _abs_url(request, f"/temp/{req_id}/id/cropped_id_face.jpg")
+    id_crop_url = _abs_url(request, f"/temp/{req_id}/id/id_crop_raw.jpg") if id_crop else None
 
     return JSONResponse({
         "ok": True,
         "req_id": req_id,
         "used_id_path": id_image_url,
         "cropped_face": cropped_url,
+        "id_crop_url": id_crop_url,
         "state": _state_for_req(req_id),
     })
 
@@ -784,11 +789,16 @@ async def verify_session(request: Request):
         return JSONResponse({"ok": False, "req_id": req_id, "error": f"Frame pipeline failed: {e}"}, status_code=400)
 
     out_img = base / "best_match.png"
+
+    id_crop_raw = id_dir / "id_crop_raw.jpg"
+    id_display_path = str(id_crop_raw) if id_crop_raw.exists() else None
+
     try:
         result = run_verif(
             id_image_path=str(id_face),
             frames_dir=str(selected_dir),
             output_path=str(out_img),
+            id_display_path=id_display_path,
         )
         if "error" in result:
             return JSONResponse({"ok": False, "req_id": req_id, "error": result["error"]}, status_code=400)
